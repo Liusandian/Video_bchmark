@@ -5,6 +5,51 @@ import math
 import os
 import glob
 
+def maintain_aspect_ratio(frame, target_width, target_height):
+    """
+    Resize frame while maintaining aspect ratio and padding with black bars if needed
+    """
+    h, w = frame.shape[:2]
+    target_ratio = target_width / target_height
+    current_ratio = w / h
+
+    if current_ratio > target_ratio:
+        # Image is wider than target, fit to width
+        new_width = target_width
+        new_height = int(target_width / current_ratio)
+        resized = cv2.resize(frame, (new_width, new_height))
+        # Add black bars on top and bottom
+        result = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        y_offset = (target_height - new_height) // 2
+        result[y_offset:y_offset+new_height, :] = resized
+    else:
+        # Image is taller than target, fit to height
+        new_height = target_height
+        new_width = int(target_height * current_ratio)
+        resized = cv2.resize(frame, (new_width, new_height))
+        # Add black bars on left and right
+        result = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        x_offset = (target_width - new_width) // 2
+        result[:, x_offset:x_offset+new_width] = resized
+    
+    return result
+
+def send_desktop_notification(title, message):
+    """
+    Send a desktop notification using plyer
+    """
+    try:
+        from plyer import notification
+        notification.notify(
+            title=title,
+            message=message,
+            app_icon=None,  # e.g. 'C:\\icon_32x32.ico'
+            timeout=10,  # seconds
+        )
+    except ImportError:
+        print("Please install plyer package for desktop notifications: pip install plyer")
+        print(f"{title}: {message}")
+
 def join_videos(video_paths, output_path):
     """
     拼接多个视频，支持2,3,4,6,8,9,12,16个视频的不同布局
@@ -131,9 +176,9 @@ def join_videos(video_paths, output_path):
             break
 
         if num_videos == 2:
-            # 调整两个帧的大小为单元格尺寸
-            frames[0] = cv2.resize(frames[0], (cell_width, cell_height))
-            frames[1] = cv2.resize(frames[1], (cell_width, cell_height))
+            # 调整两个帧的大小为单元格尺寸，保持纵横比
+            frames[0] = maintain_aspect_ratio(frames[0], cell_width, cell_height)
+            frames[1] = maintain_aspect_ratio(frames[1], cell_width, cell_height)
             
             # 添加文件名到每个视频帧
             for i in range(2):
@@ -148,10 +193,10 @@ def join_videos(video_paths, output_path):
             # 特殊处理3个视频：上面两个，下面一个居中
             top_width = cell_width
             
-            # 调整三个视频的大小
-            frames[0] = cv2.resize(frames[0], (top_width, cell_height))
-            frames[1] = cv2.resize(frames[1], (top_width, cell_height))
-            frames[2] = cv2.resize(frames[2], (top_width * 2, cell_height))
+            # 调整三个视频的大小，保持纵横比
+            frames[0] = maintain_aspect_ratio(frames[0], top_width, cell_height)
+            frames[1] = maintain_aspect_ratio(frames[1], top_width, cell_height)
+            frames[2] = maintain_aspect_ratio(frames[2], top_width * 2, cell_height)
             
             # 添加文件名到每个视频帧
             for i in range(3):
@@ -165,8 +210,8 @@ def join_videos(video_paths, output_path):
             combined_frame = np.vstack((top_row, frames[2]))
 
         else:  # 4, 6, 8, 9, 12, 16个视频的情况
-            # 将所有视频调整为相同尺寸
-            resized_frames = [cv2.resize(frame, (cell_width, cell_height)) for frame in frames]
+            # 将所有视频调整为相同尺寸，保持纵横比
+            resized_frames = [maintain_aspect_ratio(frame, cell_width, cell_height) for frame in frames]
             
             # 添加文件名到每个视频帧
             for i in range(len(resized_frames)):
@@ -201,6 +246,12 @@ def join_videos(video_paths, output_path):
     for cap in caps:
         cap.release()
     out.release()
+    
+    # 发送桌面通知
+    send_desktop_notification(
+        "视频处理完成",
+        f"已成功合并 {len(video_paths)} 个视频并保存到 {output_path}"
+    )
     print(f"处理完成！视频已保存到 {output_path}")
 
 def add_filename_with_outline(frame, filename, font, font_scale, font_thickness, text_color, bg_color, padding, outline_thickness):
@@ -260,7 +311,7 @@ def add_filename_with_outline(frame, filename, font, font_scale, font_thickness,
     
     return frame
 
-def scan_and_merge_series_videos(root_path):
+def scan_and_merge_series_videos(root_path,outputDir):
     """
     扫描指定目录下的所有子文件夹，找到同系列的视频并合并
     
@@ -281,6 +332,9 @@ def scan_and_merge_series_videos(root_path):
         # 按文件名前缀（不含序号）分组
         video_groups = {}
         for video_file in video_files:
+            # skip the file if it endswith include "merge.mp4"
+            if "merge" in video_file:
+                continue
             # 获取文件名（不含路径和扩展名）
             filename = os.path.splitext(os.path.basename(video_file))[0]
             # 移除末尾的 "-数字" 部分来获取系列名
@@ -300,7 +354,7 @@ def scan_and_merge_series_videos(root_path):
                 video_paths.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split("-")[-1]))
                 
                 # 构建输出文件路径
-                output_filename = f"{series_name}-merge.mp4"
+                output_filename = f"{outputDir}\\{series_name}-merge.mp4"
                 output_path = os.path.join(subdir_path, output_filename)
                 
                 # 调用合并函数
@@ -309,6 +363,11 @@ def scan_and_merge_series_videos(root_path):
 if __name__ == "__main__":
     # 指定Sora视频根目录
     sora_root_path = "D:\\04-dataset\\Vbench-data\\Text2vIDEO\\sora\\Sora"
+
+    outputDir = f'D:\\04-dataset\\Vbench-data\\MergeVideo'
+
+    if not os.path.exists(outputDir):
+        os.makedirs(outputDir)
     
     # 扫描并合并所有系列视频
-    scan_and_merge_series_videos(sora_root_path)
+    scan_and_merge_series_videos(sora_root_path,outputDir)
