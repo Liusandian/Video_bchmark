@@ -257,6 +257,7 @@ def join_videos(video_paths, output_path):
 def add_filename_with_outline(frame, filename, font, font_scale, font_thickness, text_color, bg_color, padding, outline_thickness):
     """
     在帧的左上角添加文件名，具有更好的可见性和可读性，添加文字描边效果使文字更清晰
+    文件名会根据长度自动调整行数，确保完整显示
     
     Args:
         frame: 视频帧
@@ -275,39 +276,96 @@ def add_filename_with_outline(frame, filename, font, font_scale, font_thickness,
     # 根据帧的宽度调整文本长度
     # 计算每个字符的近似宽度
     char_width = int(12 * font_scale)  # 假设每个字符大约12像素宽（取决于字体）
-    max_chars = max(10, int((w * 0.9) / char_width))  # 使用帧宽度的90%确定最大字符数
+    max_chars_per_line = max(10, int((w * 0.45) / char_width))  # 使用帧宽度的45%确定每行最大字符数
     
-    # 如果文件名太长，则截断并添加省略号
-    if len(filename) > max_chars:
-        display_text = filename[:max_chars-3] + "..."
-    else:
-        display_text = filename
+    # 计算最大可显示行数（根据帧高度，预留上下空间）
+    text_height, _ = cv2.getTextSize("Test", font, font_scale, font_thickness)[0]
+    max_lines = min(5, int((h * 0.3) / (text_height + padding)))  # 最多使用帧高度的30%，且不超过5行
     
-    # 获取文本大小
-    text_size, _ = cv2.getTextSize(display_text, font, font_scale, font_thickness)
-    text_w, text_h = text_size
+    def split_text_into_lines(text, max_chars, max_lines):
+        """将文本分割成多行"""
+        lines = []
+        remaining_text = text
+        line_count = 0  # 重命名为line_count，避免与文本内容混淆
+        
+        while remaining_text and line_count < max_lines:
+            # 如果剩余文本小于等于每行最大字符数，直接添加
+            if len(remaining_text) <= max_chars:
+                lines.append(remaining_text)
+                break
+            
+            # 查找分割点
+            split_point = max_chars
+            # 向前查找最近的分割字符（空格、连字符、下划线）
+            while split_point > 0 and remaining_text[split_point-1] not in [' ', '-', '_']:
+                split_point -= 1
+            
+            # 如果没找到合适的分割点，就强制分割
+            if split_point == 0:
+                split_point = max_chars
+            
+            # 添加当前行
+            current_line_text = remaining_text[:split_point].strip()  # 重命名为current_line_text
+            lines.append(current_line_text)
+            
+            # 更新剩余文本
+            remaining_text = remaining_text[split_point:].strip()
+            line_count += 1  # 使用line_count作为计数器
+            
+            # 如果是最后一行且还有剩余文本，添加省略号
+            if line_count == max_lines - 1 and remaining_text:
+                last_line = remaining_text[:max_chars-3] + "..."
+                lines.append(last_line)
+                break
+        
+        return lines
     
-    # 文本位置（左上角）
-    x, y = padding, padding + text_h
+    # 分割文本成多行
+    display_lines = split_text_into_lines(filename, max_chars_per_line, max_lines)
+    
+    # 获取每行文本的尺寸
+    line_heights = []
+    line_widths = []
+    for line in display_lines:
+        text_size, _ = cv2.getTextSize(line, font, font_scale, font_thickness)
+        line_widths.append(text_size[0])
+        line_heights.append(text_size[1])
+    
+    # 计算总高度和最大宽度
+    total_height = sum(line_heights) + (len(line_heights) - 1) * padding  # 行间距等于padding
+    max_width = max(line_widths)
+    
+    # 文本起始位置（左上角）
+    x = padding
+    y = padding + line_heights[0]  # 第一行的y坐标
     
     # 创建有足够边距的背景
     bg_padding = padding // 2
     # 背景矩形比文本稍大，添加额外的空间用于文本描边
     cv2.rectangle(frame, 
-                 (x - bg_padding - outline_thickness, y - text_h - bg_padding - outline_thickness), 
-                 (x + text_w + bg_padding + outline_thickness, y + bg_padding + outline_thickness), 
+                 (x - bg_padding - outline_thickness, 
+                  padding - bg_padding - outline_thickness),
+                 (x + max_width + bg_padding + outline_thickness,
+                  y + total_height - line_heights[0] + bg_padding + outline_thickness),
                  bg_color, -1)  # -1表示填充矩形
     
-    # 使用描边技术提高文字清晰度：先绘制黑色描边，再绘制白色文本
-    # 绘制文字描边（在8个方向上偏移并绘制黑色文字）
-    outline_color = (0, 0, 0)
-    for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)]:
-        cv2.putText(frame, display_text, 
-                   (x + dx*outline_thickness, y + dy*outline_thickness), 
-                   font, font_scale, outline_color, font_thickness, cv2.LINE_AA)
-    
-    # 绘制主要文本（白色）
-    cv2.putText(frame, display_text, (x, y), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+    # 绘制每一行文本
+    current_y = y
+    for i, line in enumerate(display_lines):
+        # 绘制文字描边（在8个方向上偏移并绘制黑色文字）
+        outline_color = (0, 0, 0)
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)]:
+            cv2.putText(frame, line,
+                       (x + dx*outline_thickness, current_y + dy*outline_thickness),
+                       font, font_scale, outline_color, font_thickness, cv2.LINE_AA)
+        
+        # 绘制主要文本（白色）
+        cv2.putText(frame, line, (x, current_y),
+                   font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+        
+        # 更新下一行的y坐标
+        if i < len(display_lines) - 1:
+            current_y += line_heights[i] + padding
     
     return frame
 
@@ -331,10 +389,13 @@ def scan_and_merge_series_videos(root_path,outputDir):
         
         # 按文件名前缀（不含序号）分组
         video_groups = {}
-        for video_file in video_files:
+        for index,video_file in enumerate(video_files):
             # skip the file if it endswith include "merge.mp4"
             if "merge" in video_file:
                 continue
+
+            if index >= 7:
+                break
             # 获取文件名（不含路径和扩展名）
             filename = os.path.splitext(os.path.basename(video_file))[0]
             # 移除末尾的 "-数字" 部分来获取系列名
@@ -368,7 +429,7 @@ if __name__ == "__main__":
     # 指定Sora视频根目录
     sora_root_path = "D:\\04-dataset\\Vbench-data\\Text2vIDEO\\sora\\Sora"
 
-    outputDir = f'D:\\04-dataset\\Vbench-data\\MergeVideo'
+    outputDir = f'D:\\04-dataset\\Vbench-data\\MergeVideoSkip2'
 
     if not os.path.exists(outputDir):
         os.makedirs(outputDir)
