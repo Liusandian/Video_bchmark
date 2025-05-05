@@ -1,19 +1,38 @@
 import cv2
 import numpy as np
 import argparse
+import math
+import os
 
 def join_videos(video_paths, output_path):
     """
-    拼接2-4个视频
+    拼接多个视频，支持2,3,4,6,8,9,12,16个视频的不同布局
     - 2个视频：左右各半
     - 3个视频：上面左右各半，下面居中
     - 4个视频：2x2网格布局
+    - 6个视频：2x3网格布局 
+    - 8个视频：2x4网格布局
+    - 9个视频：3x3网格布局
+    - 12个视频：3x4网格布局
+    - 16个视频：4x4网格布局
+    
+    在每个视频的左上角显示原始文件名
     """
     # 检查视频数量是否合法
-    if not 2 <= len(video_paths) <= 4:
-        print("Error: Number of videos must be between 2 and 4")
+    valid_counts = [2, 3, 4, 6, 8, 9, 12, 16]
+    if len(video_paths) not in valid_counts:
+        print(f"Error: Number of videos must be one of {valid_counts}")
         return
 
+    # 提取文件名（不含路径和扩展名）
+    video_names = []
+    for path in video_paths:
+        # 获取不含路径的文件名
+        full_name = os.path.basename(path)
+        # 分离文件名和扩展名
+        name_without_ext = os.path.splitext(full_name)[0]
+        video_names.append(name_without_ext)
+    
     # 打开所有视频文件
     caps = [cv2.VideoCapture(path) for path in video_paths]
     
@@ -37,27 +56,66 @@ def join_videos(video_paths, output_path):
     # 使用第一个视频的帧率
     fps = video_props[0]['fps']
 
-    # 根据视频数量决定输出尺寸和布局
-    if len(video_paths) == 2:
-        # 两个视频左右排列
-        output_width = sum(prop['width'] for prop in video_props)
-        output_height = max(prop['height'] for prop in video_props)
-    elif len(video_paths) == 3:
-        # 上面两个左右排列，下面一个居中
-        output_width = max(video_props[0]['width'] + video_props[1]['width'],
-                         video_props[2]['width'])
-        output_height = max(video_props[0]['height'], video_props[1]['height']) + video_props[2]['height']
-    else:  # 4个视频
-        # 2x2网格布局
-        output_width = max(video_props[0]['width'] + video_props[1]['width'],
-                         video_props[2]['width'] + video_props[3]['width'])
-        output_height = max(video_props[0]['height'] + video_props[2]['height'],
-                          video_props[1]['height'] + video_props[3]['height'])
+    # 根据视频数量确定布局（行数和列数）
+    num_videos = len(video_paths)
+    if num_videos == 2:
+        rows, cols = 1, 2  # 1x2 布局
+    elif num_videos == 3:
+        rows, cols = 2, 2  # 特殊布局：上面两个，下面一个居中
+    elif num_videos == 4:
+        rows, cols = 2, 2  # 2x2 布局
+    elif num_videos == 6:
+        rows, cols = 2, 3  # 2x3 布局
+    elif num_videos == 8:
+        rows, cols = 2, 4  # 2x4 布局
+    elif num_videos == 9:
+        rows, cols = 3, 3  # 3x3 布局
+    elif num_videos == 12:
+        rows, cols = 3, 4  # 3x4 布局
+    elif num_videos == 16:
+        rows, cols = 4, 4  # 4x4 布局
+
+    # 计算单个视频的统一尺寸
+    # 采用视频平均宽高的策略确保统一缩放
+    avg_width = sum(prop['width'] for prop in video_props) // len(video_props)
+    avg_height = sum(prop['height'] for prop in video_props) // len(video_props)
+    
+    # 保持视频比例，确定每个单元格的尺寸
+    if num_videos == 3:
+        # 特殊处理3个视频的情况
+        cell_width = avg_width
+        cell_height = avg_height
+        output_width = cell_width * 2  # 上排2个视频
+        output_height = cell_height * 2  # 上下各一排
+    else:
+        cell_width = avg_width
+        cell_height = avg_height
+        output_width = cell_width * cols
+        output_height = cell_height * rows
 
     # 创建视频写入器
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
+    
+    print(f"输出视频尺寸: {output_width}x{output_height}, 布局: {rows}x{cols}")
 
+    # 根据视频尺寸自动调整文本参数
+    # 确保文本大小与视频尺寸成比例
+    base_font_scale = 0.7  # 默认字体大小
+    # 对于小尺寸视频，调整字体大小
+    font_scale = base_font_scale * (min(cell_width, cell_height) / 500)
+    # 限制字体大小不超过上限
+    font_scale = min(font_scale, 1.2)
+    
+    # 设置文本参数
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_thickness = max(1, int(font_scale * 2))  # 根据字体大小调整粗细
+    text_color = (255, 255, 255)  # 白色文本
+    text_bg_color = (0, 0, 0)  # 黑色背景
+    outline_color = (0, 0, 0)  # 黑色轮廓
+    text_padding = max(5, int(font_scale * 6))  # 文本周围的填充
+
+    frame_count = 0
     while True:
         frames = []
         # 读取所有视频的帧
@@ -71,64 +129,175 @@ def join_videos(video_paths, output_path):
         if len(frames) != len(caps):
             break
 
-        if len(video_paths) == 2:
-            # 调整两个帧的大小
-            frames[0] = cv2.resize(frames[0], (output_width // 2, output_height))
-            frames[1] = cv2.resize(frames[1], (output_width // 2, output_height))
+        if num_videos == 2:
+            # 调整两个帧的大小为单元格尺寸
+            frames[0] = cv2.resize(frames[0], (cell_width, cell_height))
+            frames[1] = cv2.resize(frames[1], (cell_width, cell_height))
+            
+            # 添加文件名到每个视频帧
+            for i in range(2):
+                add_filename_to_frame(frames[i], video_names[i], font, font_scale, 
+                                      font_thickness, text_color, text_bg_color, 
+                                      outline_color, text_padding)
+            
             # 水平拼接
             combined_frame = np.hstack(frames)
 
-        elif len(video_paths) == 3:
-            # 调整帧大小
-            top_height = output_height // 2
-            bottom_height = output_height - top_height
+        elif num_videos == 3:
+            # 特殊处理3个视频：上面两个，下面一个居中
+            top_width = cell_width
             
-            frames[0] = cv2.resize(frames[0], (output_width // 2, top_height))
-            frames[1] = cv2.resize(frames[1], (output_width // 2, top_height))
-            frames[2] = cv2.resize(frames[2], (output_width, bottom_height))
+            # 调整三个视频的大小
+            frames[0] = cv2.resize(frames[0], (top_width, cell_height))
+            frames[1] = cv2.resize(frames[1], (top_width, cell_height))
+            frames[2] = cv2.resize(frames[2], (top_width * 2, cell_height))
+            
+            # 添加文件名到每个视频帧
+            for i in range(3):
+                add_filename_to_frame(frames[i], video_names[i], font, font_scale, 
+                                      font_thickness, text_color, text_bg_color, 
+                                      outline_color, text_padding)
             
             # 先合并上面两个
-            top_frame = np.hstack((frames[0], frames[1]))
+            top_row = np.hstack((frames[0], frames[1]))
             # 然后与下面的拼接
-            combined_frame = np.vstack((top_frame, frames[2]))
+            combined_frame = np.vstack((top_row, frames[2]))
 
-        else:  # 4个视频
-            # 调整所有帧的大小为相同尺寸
-            frame_width = output_width // 2
-            frame_height = output_height // 2
+        else:  # 4, 6, 8, 9, 12, 16个视频的情况
+            # 将所有视频调整为相同尺寸
+            resized_frames = [cv2.resize(frame, (cell_width, cell_height)) for frame in frames]
             
-            resized_frames = [cv2.resize(frame, (frame_width, frame_height)) for frame in frames]
+            # 添加文件名到每个视频帧
+            for i in range(len(resized_frames)):
+                add_filename_to_frame(resized_frames[i], video_names[i], font, font_scale, 
+                                      font_thickness, text_color, text_bg_color, 
+                                      outline_color, text_padding)
             
-            # 先合并上下两行
-            top_row = np.hstack((resized_frames[0], resized_frames[1]))
-            bottom_row = np.hstack((resized_frames[2], resized_frames[3]))
+            # 创建空白画布
+            combined_frame = np.zeros((output_height, output_width, 3), dtype=np.uint8)
             
-            # 再合并两行
-            combined_frame = np.vstack((top_row, bottom_row))
+            # 根据行列布局放置每个视频
+            for i in range(min(num_videos, rows * cols)):
+                row = i // cols
+                col = i % cols
+                y_start = row * cell_height
+                y_end = (row + 1) * cell_height
+                x_start = col * cell_width
+                x_end = (col + 1) * cell_width
+                
+                # 将调整大小后的帧放置到对应位置
+                combined_frame[y_start:y_end, x_start:x_end] = resized_frames[i]
 
         # 写入输出视频
         out.write(combined_frame)
+        
+        # 显示进度
+        frame_count += 1
+        if frame_count % 100 == 0:
+            print(f"已处理 {frame_count} 帧")
 
     # 释放资源
     for cap in caps:
         cap.release()
     out.release()
+    print(f"处理完成！视频已保存到 {output_path}")
+
+def add_filename_to_frame(frame, filename, font, font_scale, font_thickness, text_color, bg_color, outline_color, padding):
+    """
+    在帧的左上角添加文件名，具有更好的可见性和可读性
+    
+    Args:
+        frame: 视频帧
+        filename: 要显示的文件名
+        font: 字体
+        font_scale: 字体大小
+        font_thickness: 字体粗细
+        text_color: 文本颜色
+        bg_color: 背景颜色
+        outline_color: 轮廓颜色
+        padding: 文本周围的填充像素
+    """
+    # 获取帧的高度和宽度
+    h, w = frame.shape[:2]
+    
+    # 根据帧的宽度调整文本长度
+    # 计算每个字符的近似宽度
+    char_width = int(11 * font_scale)  # 假设每个字符大约11像素宽（取决于字体）
+    max_chars = max(10, int((w * 0.9) / char_width))  # 使用帧宽度的90%确定最大字符数
+    
+    # 如果文件名太长，则截断并添加省略号
+    if len(filename) > max_chars:
+        display_text = filename[:max_chars-3] + "..."
+    else:
+        display_text = filename
+    
+    # 获取文本大小
+    text_size, _ = cv2.getTextSize(display_text, font, font_scale, font_thickness)
+    text_w, text_h = text_size
+    
+    # 文本位置（左上角）
+    x, y = padding, padding + text_h
+    
+    # 首先绘制文本轮廓
+    # 创建有足够边距的半透明背景
+    # 背景矩形比文本稍大
+    bg_padding = padding // 2
+    cv2.rectangle(frame, 
+                 (x - bg_padding, y - text_h - bg_padding), 
+                 (x + text_w + bg_padding, y + bg_padding), 
+                 bg_color, -1)  # -1表示填充矩形
+    
+    # 绘制文本：为了实现轮廓效果，在偏移位置绘制黑色文本，然后在中心绘制白色文本
+    # 绘制主要文本
+    cv2.putText(frame, display_text, (x, y), font, font_scale, text_color, font_thickness)
+    
+    return frame
 
 if __name__ == "__main__":
     # 示例视频路径
-    path1 = f'D:\\00-Media\\01-相册摄影\\视频\\VID_20250501_154220.mp4'
-    path2 = path1.replace('VID_20250501_154220','VID_20250501_164835')
-    path3 = path1.replace('VID_20250501_154220','VID_20250501_165536')  # 请替换为实际的第三个视频路径
-    path4 = path1.replace('VID_20250501_154220','VID_20250501_164906')    # 请替换为实际的第四个视频路径
+    rootPath = f'D:\\02-Study\\02-dataset\\02-data-vbench2\\sora\\Sora\\Dynamic_Attribute\\'
     
-    output1 = f'output.mp4'
-    output2 = f'output_merge4_video.mp4'
+    # 创建16个视频路径（为了演示，这里重复使用相同的视频）
+    base_path = f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4"
     
-    # 可以选择传入2-4个视频
-    # video_paths = [path1, path2]  # 两个视频
-    video_paths = [path1, path2, path3]  # 三个视频
-    video_paths2 = [path1, path2, path3, path4]  # 四个视频
+    video_paths = [
+        f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4",
+        f"{rootPath}\\A butterfly's wings change from white to yellow.-1.mp4",
+        f"{rootPath}\\A butterfly's wings change from white to yellow.-2.mp4",
+        f"{rootPath}\\A butterfly's wings change from yellow to white.-2.mp4"
+    ]
     
-    join_videos(video_paths, output1)
-    print("Video processing completed!")
-    join_videos(video_paths2, output2)
+    # 输出视频文件名
+    output_names = {
+        2: "output_2videos.mp4",
+        3: "output_3videos.mp4",
+        4: "output_4videos_large_name.mp4",
+        6: "output_6videos.mp4",
+        8: "output_8videos.mp4",
+        9: "output_9videos.mp4",
+        12: "output_12videos.mp4",
+        16: "output_16videos.mp4"
+    }
+    
+    # 测试2、3、4视频拼接
+    # 要添加更多视频时，可以复制现有的路径或添加新路径
+    videos_2 = video_paths[:2]  # 取前2个视频
+    videos_3 = video_paths[:3]  # 取前3个视频
+    videos_4 = video_paths[:4]  # 取前4个视频
+    
+    # 创建更多视频以测试其他布局（这里仅为示例，实际使用时替换为真实视频路径）
+    videos_6 = video_paths[:2] * 3  # 复制前2个视频3次，得到6个视频
+    videos_8 = video_paths[:2] * 4  # 复制前2个视频4次，得到8个视频
+    videos_9 = video_paths[:3] * 3  # 复制前3个视频3次，得到9个视频
+    videos_12 = video_paths[:3] * 4  # 复制前3个视频4次，得到12个视频
+    videos_16 = video_paths[:4] * 4  # 复制前4个视频4次，得到16个视频
+    
+    # 根据需要取消注释来测试不同数量的视频拼接
+    join_videos(videos_4, output_names[4])  # 测试4个视频拼接
+    # join_videos(videos_2, output_names[2])  # 测试2个视频拼接
+    # join_videos(videos_3, output_names[3])  # 测试3个视频拼接
+    # join_videos(videos_6, output_names[6])  # 测试6个视频拼接
+    # join_videos(videos_8, output_names[8])  # 测试8个视频拼接
+    # join_videos(videos_9, output_names[9])  # 测试9个视频拼接
+    # join_videos(videos_12, output_names[12])  # 测试12个视频拼接
+    # join_videos(videos_16, output_names[16])  # 测试16个视频拼接
