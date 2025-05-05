@@ -101,19 +101,19 @@ def join_videos(video_paths, output_path):
 
     # 根据视频尺寸自动调整文本参数
     # 确保文本大小与视频尺寸成比例
-    base_font_scale = 0.7  # 默认字体大小
+    base_font_scale = 1.0  # 增加字体基础大小
     # 对于小尺寸视频，调整字体大小
     font_scale = base_font_scale * (min(cell_width, cell_height) / 500)
     # 限制字体大小不超过上限
-    font_scale = min(font_scale, 1.2)
+    font_scale = min(max(font_scale, 0.8), 1.5)  # 确保最小/最大字体大小
     
     # 设置文本参数
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_thickness = max(1, int(font_scale * 2))  # 根据字体大小调整粗细
+    font_thickness = max(2, int(font_scale * 2))  # 增加字体粗细，提高清晰度
     text_color = (255, 255, 255)  # 白色文本
     text_bg_color = (0, 0, 0)  # 黑色背景
-    outline_color = (0, 0, 0)  # 黑色轮廓
-    text_padding = max(5, int(font_scale * 6))  # 文本周围的填充
+    text_padding = max(10, int(font_scale * 8))  # 增加文本周围的填充
+    outline_thickness = max(1, int(font_scale * 1.5))  # 文字描边粗细
 
     frame_count = 0
     while True:
@@ -136,9 +136,9 @@ def join_videos(video_paths, output_path):
             
             # 添加文件名到每个视频帧
             for i in range(2):
-                add_filename_to_frame(frames[i], video_names[i], font, font_scale, 
-                                      font_thickness, text_color, text_bg_color, 
-                                      outline_color, text_padding)
+                add_filename_with_outline(frames[i], video_names[i], font, font_scale, 
+                                        font_thickness, text_color, text_bg_color, 
+                                        text_padding, outline_thickness)
             
             # 水平拼接
             combined_frame = np.hstack(frames)
@@ -154,9 +154,9 @@ def join_videos(video_paths, output_path):
             
             # 添加文件名到每个视频帧
             for i in range(3):
-                add_filename_to_frame(frames[i], video_names[i], font, font_scale, 
-                                      font_thickness, text_color, text_bg_color, 
-                                      outline_color, text_padding)
+                add_filename_with_outline(frames[i], video_names[i], font, font_scale, 
+                                        font_thickness, text_color, text_bg_color, 
+                                        text_padding, outline_thickness)
             
             # 先合并上面两个
             top_row = np.hstack((frames[0], frames[1]))
@@ -169,9 +169,9 @@ def join_videos(video_paths, output_path):
             
             # 添加文件名到每个视频帧
             for i in range(len(resized_frames)):
-                add_filename_to_frame(resized_frames[i], video_names[i], font, font_scale, 
-                                      font_thickness, text_color, text_bg_color, 
-                                      outline_color, text_padding)
+                add_filename_with_outline(resized_frames[i], video_names[i], font, font_scale, 
+                                        font_thickness, text_color, text_bg_color, 
+                                        text_padding, outline_thickness)
             
             # 创建空白画布
             combined_frame = np.zeros((output_height, output_width, 3), dtype=np.uint8)
@@ -202,9 +202,9 @@ def join_videos(video_paths, output_path):
     out.release()
     print(f"处理完成！视频已保存到 {output_path}")
 
-def add_filename_to_frame(frame, filename, font, font_scale, font_thickness, text_color, bg_color, outline_color, padding):
+def add_filename_with_outline(frame, filename, font, font_scale, font_thickness, text_color, bg_color, padding, outline_thickness):
     """
-    在帧的左上角添加文件名，具有更好的可见性和可读性
+    在帧的左上角添加文件名，具有更好的可见性和可读性，添加文字描边效果使文字更清晰
     
     Args:
         frame: 视频帧
@@ -214,15 +214,15 @@ def add_filename_to_frame(frame, filename, font, font_scale, font_thickness, tex
         font_thickness: 字体粗细
         text_color: 文本颜色
         bg_color: 背景颜色
-        outline_color: 轮廓颜色
         padding: 文本周围的填充像素
+        outline_thickness: 文字描边粗细
     """
     # 获取帧的高度和宽度
     h, w = frame.shape[:2]
     
     # 根据帧的宽度调整文本长度
     # 计算每个字符的近似宽度
-    char_width = int(11 * font_scale)  # 假设每个字符大约11像素宽（取决于字体）
+    char_width = int(12 * font_scale)  # 假设每个字符大约12像素宽（取决于字体）
     max_chars = max(10, int((w * 0.9) / char_width))  # 使用帧宽度的90%确定最大字符数
     
     # 如果文件名太长，则截断并添加省略号
@@ -238,18 +238,24 @@ def add_filename_to_frame(frame, filename, font, font_scale, font_thickness, tex
     # 文本位置（左上角）
     x, y = padding, padding + text_h
     
-    # 首先绘制文本轮廓
-    # 创建有足够边距的半透明背景
-    # 背景矩形比文本稍大
+    # 创建有足够边距的背景
     bg_padding = padding // 2
+    # 背景矩形比文本稍大，添加额外的空间用于文本描边
     cv2.rectangle(frame, 
-                 (x - bg_padding, y - text_h - bg_padding), 
-                 (x + text_w + bg_padding, y + bg_padding), 
+                 (x - bg_padding - outline_thickness, y - text_h - bg_padding - outline_thickness), 
+                 (x + text_w + bg_padding + outline_thickness, y + bg_padding + outline_thickness), 
                  bg_color, -1)  # -1表示填充矩形
     
-    # 绘制文本：为了实现轮廓效果，在偏移位置绘制黑色文本，然后在中心绘制白色文本
-    # 绘制主要文本
-    cv2.putText(frame, display_text, (x, y), font, font_scale, text_color, font_thickness)
+    # 使用描边技术提高文字清晰度：先绘制黑色描边，再绘制白色文本
+    # 绘制文字描边（在8个方向上偏移并绘制黑色文字）
+    outline_color = (0, 0, 0)  # 黑色描边
+    for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)]:
+        cv2.putText(frame, display_text, 
+                   (x + dx*outline_thickness, y + dy*outline_thickness), 
+                   font, font_scale, outline_color, font_thickness, cv2.LINE_AA)
+    
+    # 绘制主要文本（白色）
+    cv2.putText(frame, display_text, (x, y), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
     
     return frame
 
@@ -260,17 +266,23 @@ if __name__ == "__main__":
     # 创建16个视频路径（为了演示，这里重复使用相同的视频）
     base_path = f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4"
     
+    # add 4 videos path 
+    rootPath2 =f'D:\\04-dataset\\Vbench-data\\Text2vIDEO\\sora\\Sora\\Motion_Rationality\\'
     video_paths = [
-        f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4",
-        f"{rootPath}\\A butterfly's wings change from white to yellow.-1.mp4",
-        f"{rootPath}\\A butterfly's wings change from white to yellow.-2.mp4",
-        f"{rootPath}\\A butterfly's wings change from yellow to white.-2.mp4"
+        f"{rootPath2}\\A person is biting into an apple.-0.mp4",
+        f"{rootPath2}\\A person is biting into an apple.-1.mp4",
+        f"{rootPath2}\\A person is biting into an apple.-2.mp4",
+        # f"{rootPath2}\\a bear hunting for prey.-3.mp4"
+        # f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4",
+        # f"{rootPath}\\A butterfly's wings change from white to yellow.-1.mp4",
+        # f"{rootPath}\\A butterfly's wings change from white to yellow.-2.mp4",
+        # f"{rootPath}\\A butterfly's wings change from yellow to white.-2.mp4"
     ]
     
     # 输出视频文件名
     output_names = {
         2: "output_2videos.mp4",
-        3: "output_3videos.mp4",
+        3: "output_3videos_more_clear.mp4",
         4: "output_4videos_large_name.mp4",
         6: "output_6videos.mp4",
         8: "output_8videos.mp4",
@@ -283,7 +295,8 @@ if __name__ == "__main__":
     # 要添加更多视频时，可以复制现有的路径或添加新路径
     videos_2 = video_paths[:2]  # 取前2个视频
     videos_3 = video_paths[:3]  # 取前3个视频
-    videos_4 = video_paths[:4]  # 取前4个视频
+    # videos_4 = video_paths[:4]  # 取前4个视频
+    videos_8 = video_paths[:8]  # 取前4个视频
     
     # 创建更多视频以测试其他布局（这里仅为示例，实际使用时替换为真实视频路径）
     videos_6 = video_paths[:2] * 3  # 复制前2个视频3次，得到6个视频
@@ -293,7 +306,7 @@ if __name__ == "__main__":
     videos_16 = video_paths[:4] * 4  # 复制前4个视频4次，得到16个视频
     
     # 根据需要取消注释来测试不同数量的视频拼接
-    join_videos(videos_4, output_names[4])  # 测试4个视频拼接
+    join_videos(videos_3, output_names[3])  # 测试4个视频拼接
     # join_videos(videos_2, output_names[2])  # 测试2个视频拼接
     # join_videos(videos_3, output_names[3])  # 测试3个视频拼接
     # join_videos(videos_6, output_names[6])  # 测试6个视频拼接
