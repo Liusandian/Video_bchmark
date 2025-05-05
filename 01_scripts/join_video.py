@@ -343,7 +343,11 @@ def scan_and_merge_series_videos(root_path,outputDir):
             if series_name not in video_groups:
                 video_groups[series_name] = []
             video_groups[series_name].append(video_file)
-        
+        # add path to merge video
+        path_to_merge_video = os.path.join(outputDir,subdir)
+        if not os.path.exists(path_to_merge_video):
+            os.makedirs(path_to_merge_video)
+
         # 处理每个视频系列
         for series_name, video_paths in video_groups.items():
             if len(video_paths) > 1:  # 只处理有多个视频的系列
@@ -354,7 +358,7 @@ def scan_and_merge_series_videos(root_path,outputDir):
                 video_paths.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split("-")[-1]))
                 
                 # 构建输出文件路径
-                output_filename = f"{outputDir}\\{series_name}-merge.mp4"
+                output_filename = f"{path_to_merge_video}\\{series_name}-merge.mp4"
                 output_path = os.path.join(subdir_path, output_filename)
                 
                 # 调用合并函数
