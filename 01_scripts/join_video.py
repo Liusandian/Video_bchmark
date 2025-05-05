@@ -3,6 +3,7 @@ import numpy as np
 import argparse
 import math
 import os
+import glob
 
 def join_videos(video_paths, output_path):
     """
@@ -248,7 +249,7 @@ def add_filename_with_outline(frame, filename, font, font_scale, font_thickness,
     
     # 使用描边技术提高文字清晰度：先绘制黑色描边，再绘制白色文本
     # 绘制文字描边（在8个方向上偏移并绘制黑色文字）
-    outline_color = (0, 0, 0)  # 黑色描边
+    outline_color = (0, 0, 0)
     for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)]:
         cv2.putText(frame, display_text, 
                    (x + dx*outline_thickness, y + dy*outline_thickness), 
@@ -259,58 +260,55 @@ def add_filename_with_outline(frame, filename, font, font_scale, font_thickness,
     
     return frame
 
+def scan_and_merge_series_videos(root_path):
+    """
+    扫描指定目录下的所有子文件夹，找到同系列的视频并合并
+    
+    Args:
+        root_path: Sora视频根目录路径
+    """
+    # 遍历所有子文件夹
+    for subdir in os.listdir(root_path):
+        subdir_path = os.path.join(root_path, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+            
+        print(f"\n处理文件夹: {subdir}")
+        
+        # 获取所有mp4文件
+        video_files = glob.glob(os.path.join(subdir_path, "*.mp4"))
+        
+        # 按文件名前缀（不含序号）分组
+        video_groups = {}
+        for video_file in video_files:
+            # 获取文件名（不含路径和扩展名）
+            filename = os.path.splitext(os.path.basename(video_file))[0]
+            # 移除末尾的 "-数字" 部分来获取系列名
+            series_name = "-".join(filename.split("-")[:-1])
+            
+            if series_name not in video_groups:
+                video_groups[series_name] = []
+            video_groups[series_name].append(video_file)
+        
+        # 处理每个视频系列
+        for series_name, video_paths in video_groups.items():
+            if len(video_paths) > 1:  # 只处理有多个视频的系列
+                print(f"\n合并系列: {series_name}")
+                print(f"找到 {len(video_paths)} 个视频文件")
+                
+                # 按照数字序号排序
+                video_paths.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split("-")[-1]))
+                
+                # 构建输出文件路径
+                output_filename = f"{series_name}-merge.mp4"
+                output_path = os.path.join(subdir_path, output_filename)
+                
+                # 调用合并函数
+                join_videos(video_paths, output_path)
+
 if __name__ == "__main__":
-    # 示例视频路径
-    rootPath = f'D:\\02-Study\\02-dataset\\02-data-vbench2\\sora\\Sora\\Dynamic_Attribute\\'
+    # 指定Sora视频根目录
+    sora_root_path = "D:\\04-dataset\\Vbench-data\\Text2vIDEO\\sora\\Sora"
     
-    # 创建16个视频路径（为了演示，这里重复使用相同的视频）
-    base_path = f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4"
-    
-    # add 4 videos path 
-    rootPath2 =f'D:\\04-dataset\\Vbench-data\\Text2vIDEO\\sora\\Sora\\Motion_Rationality\\'
-    video_paths = [
-        f"{rootPath2}\\A person is biting into an apple.-0.mp4",
-        f"{rootPath2}\\A person is biting into an apple.-1.mp4",
-        f"{rootPath2}\\A person is biting into an apple.-2.mp4",
-        # f"{rootPath2}\\a bear hunting for prey.-3.mp4"
-        # f"{rootPath}\\A butterfly's wings change from white to yellow.-0.mp4",
-        # f"{rootPath}\\A butterfly's wings change from white to yellow.-1.mp4",
-        # f"{rootPath}\\A butterfly's wings change from white to yellow.-2.mp4",
-        # f"{rootPath}\\A butterfly's wings change from yellow to white.-2.mp4"
-    ]
-    
-    # 输出视频文件名
-    output_names = {
-        2: "output_2videos.mp4",
-        3: "output_3videos_more_clear.mp4",
-        4: "output_4videos_large_name.mp4",
-        6: "output_6videos.mp4",
-        8: "output_8videos.mp4",
-        9: "output_9videos.mp4",
-        12: "output_12videos.mp4",
-        16: "output_16videos.mp4"
-    }
-    
-    # 测试2、3、4视频拼接
-    # 要添加更多视频时，可以复制现有的路径或添加新路径
-    videos_2 = video_paths[:2]  # 取前2个视频
-    videos_3 = video_paths[:3]  # 取前3个视频
-    # videos_4 = video_paths[:4]  # 取前4个视频
-    videos_8 = video_paths[:8]  # 取前4个视频
-    
-    # 创建更多视频以测试其他布局（这里仅为示例，实际使用时替换为真实视频路径）
-    videos_6 = video_paths[:2] * 3  # 复制前2个视频3次，得到6个视频
-    videos_8 = video_paths[:2] * 4  # 复制前2个视频4次，得到8个视频
-    videos_9 = video_paths[:3] * 3  # 复制前3个视频3次，得到9个视频
-    videos_12 = video_paths[:3] * 4  # 复制前3个视频4次，得到12个视频
-    videos_16 = video_paths[:4] * 4  # 复制前4个视频4次，得到16个视频
-    
-    # 根据需要取消注释来测试不同数量的视频拼接
-    join_videos(videos_3, output_names[3])  # 测试4个视频拼接
-    # join_videos(videos_2, output_names[2])  # 测试2个视频拼接
-    # join_videos(videos_3, output_names[3])  # 测试3个视频拼接
-    # join_videos(videos_6, output_names[6])  # 测试6个视频拼接
-    # join_videos(videos_8, output_names[8])  # 测试8个视频拼接
-    # join_videos(videos_9, output_names[9])  # 测试9个视频拼接
-    # join_videos(videos_12, output_names[12])  # 测试12个视频拼接
-    # join_videos(videos_16, output_names[16])  # 测试16个视频拼接
+    # 扫描并合并所有系列视频
+    scan_and_merge_series_videos(sora_root_path)
