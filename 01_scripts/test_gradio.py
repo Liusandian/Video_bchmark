@@ -7,54 +7,57 @@
 # 然后图片会显示在输出框中
 
 import gradio as gr
+from PIL import Image
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import io
 
-def generate_image(text):
+def process_image(input_image):
     """
-    简单的函数，将文本转换为图片
+    处理图像：水平翻转并缩小到原来的1/4大小
     """
-    # 创建一个白色背景图片
-    width, height = 400, 200
-    image = Image.new('RGB', (width, height), color='white')
-    draw = ImageDraw.Draw(image)
+    if input_image is None:
+        return None
     
-    try:
-        # 尝试加载一个字体，如果失败则使用默认字体
-        font = ImageFont.truetype("arial.ttf", 20)
-    except IOError:
-        font = ImageFont.load_default()
+    # 转换为PIL图像（如果是numpy数组）
+    if isinstance(input_image, np.ndarray):
+        img = Image.fromarray(input_image)
+    else:
+        img = input_image
     
-    # 绘制文本
-    text_width, text_height = draw.textbbox((0, 0), text, font=font)[2:4]
-    position = ((width - text_width) // 2, (height - text_height) // 2)
-    draw.text(position, text, fill='black', font=font)
+    # 水平翻转
+    flipped_img = img.transpose(Image.FLIP_LEFT_RIGHT)
     
-    return image
+    # 获取当前尺寸
+    width, height = flipped_img.size
+    
+    # 缩小到原来的1/4大小（宽和高各减半）
+    new_width = width // 2
+    new_height = height // 2
+    resized_img = flipped_img.resize((new_width, new_height), Image.LANCZOS)
+    
+    return resized_img
 
 def gradio_interface():
     with gr.Blocks() as demo:
-        gr.Markdown("## 简单文本到图片转换器")
+        gr.Markdown("## 图像处理工具")
+        gr.Markdown("上传一张图片，程序会将其水平翻转并缩小到原来的1/4大小")
         
         with gr.Row():
-            # 输入框
-            text_input = gr.Textbox(
-                label="请输入文字",
-                placeholder="在这里输入要转换为图片的文字",
-                lines=3
+            # 输入图像
+            image_input = gr.Image(
+                label="上传图像",
+                type="pil"
             )
         
         # 按钮
-        generate_button = gr.Button("生成图片")
+        process_button = gr.Button("处理图像")
         
-        # 输出框
-        image_output = gr.Image(label="生成的图片")
+        # 输出图像
+        image_output = gr.Image(label="处理后的图像")
         
         # 设置点击按钮时的操作
-        generate_button.click(
-            fn=generate_image,
-            inputs=[text_input],
+        process_button.click(
+            fn=process_image,
+            inputs=[image_input],
             outputs=[image_output]
         )
     
