@@ -451,7 +451,18 @@ def add_video_task(**inputs):
 
     start_image_data, end_image_data = get_preview_images(inputs)
 
-    queue.append({
+    # 提取转场模式相关参数
+    transition_mode = inputs.get("transition_mode", False)
+    source_video_1 = inputs.get("source_video_1", None)
+    source_video_2 = inputs.get("source_video_2", None)
+    
+    # 如果是转场模式，准备source_videos参数
+    source_videos = None
+    if transition_mode and source_video_1 and source_video_2:
+        source_videos = [source_video_1, source_video_2]
+        
+    # 将新参数添加到任务中
+    task = {
         "id": current_task_id,
         "params": inputs.copy(),
         "repeats": inputs["repeat_generation"],
@@ -461,8 +472,12 @@ def add_video_task(**inputs):
         "start_image_data": start_image_data,
         "end_image_data": end_image_data,
         "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in start_image_data] if start_image_data != None else None,
-        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None
-    })
+        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None,
+        "transition_mode": transition_mode,
+        "source_videos": source_videos
+    }
+    
+    queue.append(task)
     return update_queue_data(queue)
 
 def move_up(queue, selected_indices):
@@ -2406,8 +2421,9 @@ def generate_video(
     cfg_star_switch,
     cfg_zero_step,
     state,
-    model_filename
-
+    model_filename,
+    transition_mode=False,
+    source_videos=None,
 ):
     global wan_model, offloadobj, reload_needed
     gen = get_gen_info(state)
@@ -2982,6 +2998,29 @@ def generate_video(
     if temp_filename!= None and  os.path.isfile(temp_filename):
         os.remove(temp_filename)
     offload.unload_loras_from_model(trans)
+
+    # 处理转场模式
+    if transition_mode and source_videos and len(source_videos) >= 2:
+        # 提取视频帧
+        last_frame_video1, _ = extract_video_frames(source_videos[0])
+        _, first_frame_video2 = extract_video_frames(source_videos[1])
+        
+        # 替换image_start和image_end
+        image_start = last_frame_video1
+        image_end = first_frame_video2
+    
+    # 如果是转场模式，合并视频
+    if transition_mode and source_videos and len(source_videos) >= 2:
+        # 合并视频
+        final_video_path = merge_videos(
+            source_videos[0], 
+            video_path,  # 生成的转场视频
+            source_videos[1], 
+            os.path.join(save_path, f"merged_{os.path.basename(video_path)}")
+        )
+        
+        # 将合并后的视频路径添加到文件列表
+        file_list.append(final_video_path)
 
 def prepare_generate_video(state):    
     if state.get("validate_success",0) != 1:
@@ -3668,7 +3707,7 @@ def download_loras():
     return
 
 def refresh_image_prompt_type(state, image_prompt_type):
-    return gr.update(visible = "S" in image_prompt_type ), gr.update(visible = "E" in image_prompt_type ), gr.update(visible = "V" in image_prompt_type) , gr.update(visible = "V" in image_prompt_type ) 
+    return gr.update(visible = "S" in image_prompt_type ), gr.update(visible = "E" in image_prompt_type ), gr.update(visible = "V" in image_prompt_type ) , gr.update(visible = "V" in image_prompt_type ) 
 
 def refresh_video_prompt_type(state, video_prompt_type):
     return gr.Gallery(visible = "I" in video_prompt_type), gr.Video(visible= "V" in video_prompt_type),gr.Video(visible= "M" in video_prompt_type ), gr.Text(visible= "V" in video_prompt_type) , gr.Checkbox(visible= "I" in video_prompt_type)
@@ -5205,3 +5244,61 @@ if __name__ == "__main__":
             url = "http://" + server_name 
         webbrowser.open(url + ":" + str(server_port), new = 0, autoraise = True)
     demo.launch(server_name=server_name, server_port=server_port, share=args.share, allowed_paths=[save_path])
+
+def extract_video_frames(video_path):
+    """
+    从视频中提取首帧和尾帧
+    返回: first_frame, last_frame (PIL.Image格式)
+    """
+    import cv2
+    from PIL import Image
+    import numpy as np
+    
+    cap = cv2.VideoCapture(video_path)
+    
+    # 获取首帧
+    ret, first_frame = cap.read()
+    first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+    first_frame = Image.fromarray(first_frame)
+    
+    # 获取视频总帧数
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # 设置到最后一帧的前一个位置
+    cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+    ret, last_frame = cap.read()
+    last_frame = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
+    last_frame = Image.fromarray(last_frame)
+    
+    cap.release()
+    return first_frame, last_frame
+
+def merge_videos(video1_path, transition_video_path, video2_path, output_path):
+    """
+    将两个视频和中间的转场视频合并为一个视频
+    """
+    import subprocess
+    import os
+    import tempfile
+    
+    # 创建临时文件列表
+    list_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+    list_file.write(f"file '{video1_path}'\n".encode())
+    list_file.write(f"file '{transition_video_path}'\n".encode())
+    list_file.write(f"file '{video2_path}'\n".encode())
+    list_file.close()
+    
+    # 使用FFmpeg合并视频
+    cmd = [
+        "ffmpeg", "-y", 
+        "-f", "concat", 
+        "-safe", "0", 
+        "-i", list_file.name, 
+        "-c", "copy", 
+        output_path
+    ]
+    
+    subprocess.run(cmd, check=True)
+    os.unlink(list_file.name)
+    
+    return output_path
