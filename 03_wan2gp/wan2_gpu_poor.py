@@ -3001,26 +3001,42 @@ def generate_video(
 
     # 处理转场模式
     if transition_mode and source_videos and len(source_videos) >= 2:
-        # 提取视频帧
-        last_frame_video1, _ = extract_video_frames(source_videos[0])
-        _, first_frame_video2 = extract_video_frames(source_videos[1])
-        
-        # 替换image_start和image_end
-        image_start = last_frame_video1
-        image_end = first_frame_video2
+        try:
+            # 提取视频帧
+            send_cmd("status", "提取视频帧...")
+            last_frame_video1, _ = extract_video_frames(source_videos[0])
+            _, first_frame_video2 = extract_video_frames(source_videos[1])
+            
+            # 替换image_start和image_end
+            image_start = last_frame_video1
+            image_end = first_frame_video2
+            send_cmd("status", "视频帧提取完成")
+        except Exception as e:
+            send_cmd("error", f"提取视频帧失败: {str(e)}")
+            return
     
-    # 如果是转场模式，合并视频
-    if transition_mode and source_videos and len(source_videos) >= 2:
-        # 合并视频
-        final_video_path = merge_videos(
-            source_videos[0], 
-            video_path,  # 生成的转场视频
-            source_videos[1], 
-            os.path.join(save_path, f"merged_{os.path.basename(video_path)}")
-        )
-        
-        # 将合并后的视频路径添加到文件列表
-        file_list.append(final_video_path)
+    # 如果是转场模式，合并视频 (移至生成完成后，确保在资源清理之前)
+    if transition_mode and source_videos and len(source_videos) >= 2 and video_path:
+        try:
+            send_cmd("status", "正在合并视频...")
+            # 生成输出文件名
+            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss")
+            merged_filename = f"merged_{timestamp}_{os.path.basename(video_path)}"
+            merged_path = os.path.join(save_path, merged_filename)
+            
+            # 合并视频
+            merged_video_path = merge_videos(
+                source_videos[0], 
+                video_path,  # 生成的转场视频
+                source_videos[1], 
+                merged_path
+            )
+            
+            # 将合并后的视频路径添加到文件列表
+            file_list.append(merged_video_path)
+            send_cmd("status", f"视频合并完成: {merged_video_path}")
+        except Exception as e:
+            send_cmd("error", f"合并视频失败: {str(e)}")
 
 def prepare_generate_video(state):    
     if state.get("validate_success",0) != 1:
@@ -5247,17 +5263,27 @@ if __name__ == "__main__":
 
 def extract_video_frames(video_path):
     """
-    从视频中提取首帧和尾帧
-    返回: first_frame, last_frame (PIL.Image格式)
+    从视频中提取首帧和尾帧 (Ubuntu兼容版本)
     """
     import cv2
     from PIL import Image
     import numpy as np
+    import os
     
-    cap = cv2.VideoCapture(video_path)
+    # 确保使用绝对路径
+    video_path = os.path.abspath(video_path)
+    
+    # 在Ubuntu上，有时需要使用这种方式确保路径被正确识别
+    cap = cv2.VideoCapture(str(video_path))
+    
+    if not cap.isOpened():
+        raise ValueError(f"无法打开视频文件: {video_path}")
     
     # 获取首帧
     ret, first_frame = cap.read()
+    if not ret:
+        raise ValueError(f"无法读取视频首帧: {video_path}")
+    
     first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
     first_frame = Image.fromarray(first_frame)
     
@@ -5265,8 +5291,16 @@ def extract_video_frames(video_path):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     # 设置到最后一帧的前一个位置
-    cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
     ret, last_frame = cap.read()
+    
+    if not ret:
+        # 如果无法读取最后一帧，尝试倒数第二帧
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
+        ret, last_frame = cap.read()
+        if not ret:
+            raise ValueError(f"无法读取视频末尾帧: {video_path}")
+    
     last_frame = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
     last_frame = Image.fromarray(last_frame)
     
@@ -5275,17 +5309,24 @@ def extract_video_frames(video_path):
 
 def merge_videos(video1_path, transition_video_path, video2_path, output_path):
     """
-    将两个视频和中间的转场视频合并为一个视频
+    将两个视频和中间的转场视频合并为一个视频 (Ubuntu兼容版本)
     """
     import subprocess
     import os
     import tempfile
+    import shlex
     
     # 创建临时文件列表
     list_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-    list_file.write(f"file '{video1_path}'\n".encode())
-    list_file.write(f"file '{transition_video_path}'\n".encode())
-    list_file.write(f"file '{video2_path}'\n".encode())
+    
+    # 使用绝对路径并进行适当转义
+    video1_abs = os.path.abspath(video1_path)
+    transition_abs = os.path.abspath(transition_video_path)
+    video2_abs = os.path.abspath(video2_path)
+    
+    list_file.write(f"file '{video1_abs.replace("'", "\\'")}'\n".encode())
+    list_file.write(f"file '{transition_abs.replace("'", "\\'")}'\n".encode())
+    list_file.write(f"file '{video2_abs.replace("'", "\\'")}'\n".encode())
     list_file.close()
     
     # 使用FFmpeg合并视频
@@ -5298,7 +5339,43 @@ def merge_videos(video1_path, transition_video_path, video2_path, output_path):
         output_path
     ]
     
-    subprocess.run(cmd, check=True)
-    os.unlink(list_file.name)
+    # 使用更安全的subprocess调用方式
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            print(f"FFmpeg错误: {stderr.decode()}")
+            raise Exception(f"视频合并失败: {stderr.decode()}")
+    finally:
+        if os.path.exists(list_file.name):
+            os.unlink(list_file.name)
     
     return output_path
+
+def check_dependencies():
+    """检查系统依赖项是否已安装"""
+    import subprocess
+    import shutil
+    
+    # 检查FFmpeg
+    if shutil.which("ffmpeg") is None:
+        print("警告: 未找到FFmpeg，请使用以下命令安装:")
+        print("  sudo apt update && sudo apt install -y ffmpeg")
+        return False
+    
+    # 检查OpenCV
+    try:
+        import cv2
+    except ImportError:
+        print("警告: 未找到OpenCV，请使用以下命令安装:")
+        print("  pip install opencv-python")
+        return False
+    
+    return True
+
+# 在程序启动时调用
+if __name__ == "__main__":
+    if not check_dependencies():
+        print("请安装所需依赖后重试")
+        # 可以选择继续或退出
