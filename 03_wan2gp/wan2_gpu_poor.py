@@ -451,18 +451,7 @@ def add_video_task(**inputs):
 
     start_image_data, end_image_data = get_preview_images(inputs)
 
-    # 提取转场模式相关参数
-    transition_mode = inputs.get("transition_mode", False)
-    source_video_1 = inputs.get("source_video_1", None)
-    source_video_2 = inputs.get("source_video_2", None)
-    
-    # 如果是转场模式，准备source_videos参数
-    source_videos = None
-    if transition_mode and source_video_1 and source_video_2:
-        source_videos = [source_video_1, source_video_2]
-        
-    # 将新参数添加到任务中
-    task = {
+    queue.append({
         "id": current_task_id,
         "params": inputs.copy(),
         "repeats": inputs["repeat_generation"],
@@ -472,12 +461,8 @@ def add_video_task(**inputs):
         "start_image_data": start_image_data,
         "end_image_data": end_image_data,
         "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in start_image_data] if start_image_data != None else None,
-        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None,
-        "transition_mode": transition_mode,
-        "source_videos": source_videos
-    }
-    
-    queue.append(task)
+        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None
+    })
     return update_queue_data(queue)
 
 def move_up(queue, selected_indices):
@@ -2331,6 +2316,245 @@ def preprocess_video(process_type, height, width, video_in, max_frames, start_fr
     return torch.stack(torch_frames) 
 
 
+# Extract a specific frame from a video
+def extract_frame_from_video(video_path, frame_index=0, as_pil=True):
+    """
+    Extract a specific frame from a video.
+    
+    Args:
+        video_path: Path to the video file
+        frame_index: Index of the frame to extract (0 for first, -1 for last)
+        as_pil: Return as PIL Image if True, otherwise as tensor
+    
+    Returns:
+        Extracted frame as PIL Image or tensor
+    """
+    frames_list = get_resampled_video(video_path, 0, 0, target_fps=16)  # Get all frames
+    
+    if len(frames_list) == 0:
+        return None
+    
+    if frame_index == -1:
+        frame_index = len(frames_list) - 1
+        
+    if 0 <= frame_index < len(frames_list):
+        frame = frames_list[frame_index]
+        if as_pil:
+            return Image.fromarray(np.clip(frame.cpu().numpy(), 0, 255).astype(np.uint8))
+        return frame
+    
+    return None
+
+# Combine videos using ffmpeg
+def combine_videos(video_paths, output_path):
+    """
+    Combine multiple videos into one using ffmpeg.
+    
+    Args:
+        video_paths: List of paths to the videos to combine
+        output_path: Path to save the combined video
+    
+    Returns:
+        Path to the combined video or None if failed
+    """
+    import subprocess
+    import tempfile
+    
+    # Create a temporary file for the list of videos to concatenate
+    with tempfile.NamedTemporaryFile(suffix='.txt', delete=False, mode='w') as f:
+        list_path = f.name
+        for video_path in video_paths:
+            if video_path and os.path.exists(video_path):
+                f.write(f"file '{os.path.abspath(video_path)}'\n")
+    
+    # Use ffmpeg to concatenate the videos
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
+            '-i', list_path, '-c', 'copy', output_path
+        ], check=True)
+        
+        # Delete the temporary file
+        os.remove(list_path)
+        return output_path
+    except Exception as e:
+        print(f"Error combining videos: {e}")
+        return None
+
+# Classify model type based on model filename
+def classify_model_type(model_filename):
+    """
+    Classify model type based on model filename.
+    
+    Args:
+        model_filename: The model filename
+        
+    Returns:
+        Model type: 'i2v', 't2v', 'fl2v', or 'other'
+    """
+    model_filename = model_filename.lower()
+    
+    if 'image2video' in model_filename:
+        return 'i2v'
+    elif 'flf2v' in model_filename:
+        return 'fl2v'
+    elif any(keyword in model_filename for keyword in ['text2video', 'diffusion_forcing', 'reels']):
+        return 't2v'
+    else:
+        return 'other'
+
+# Save user input information to JSON
+def save_user_input_info(model_filename, task_params, output_video_path, user_id="default_user"):
+    """
+    Save user input information to JSON file based on model type.
+    
+    Args:
+        model_filename: The model filename used
+        task_params: Dictionary containing task parameters
+        output_video_path: Path to the generated video
+        user_id: User identification
+        
+    Returns:
+        Path to the saved JSON file
+    """
+    import json
+    from datetime import datetime
+    
+    # Classify model type
+    model_type = classify_model_type(model_filename)
+    
+    # Create base directory for saving files
+    base_save_dir = os.path.join(save_path, model_type)
+    os.makedirs(base_save_dir, exist_ok=True)
+    
+    # Generate timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
+    
+    # Create unique filename
+    json_filename = f"{timestamp}_{user_id}_input.json"
+    json_path = os.path.join(base_save_dir, json_filename)
+    
+    # Prepare user input information
+    user_info = {
+        "timestamp": timestamp,
+        "datetime": datetime.now().isoformat(),
+        "user_id": user_id,
+        "model_name": model_filename,
+        "model_type": model_type,
+        "task_id": task_params.get("task_id", ""),
+        "prompt": task_params.get("prompt", ""),
+        "negative_prompt": task_params.get("negative_prompt", ""),
+        "resolution": task_params.get("resolution", ""),
+        "video_length": task_params.get("video_length", 0),
+        "seed": task_params.get("seed", -1),
+        "num_inference_steps": task_params.get("num_inference_steps", 30),
+        "guidance_scale": task_params.get("guidance_scale", 5.0),
+        "flow_shift": task_params.get("flow_shift", 3.0),
+        "image_prompt_type": task_params.get("image_prompt_type", ""),
+        "output_video_path": output_video_path,
+        "input_images": [],
+        "input_videos": []
+    }
+    
+    # Save input images information if available
+    if task_params.get("image_start"):
+        for i, img in enumerate(task_params["image_start"]):
+            if img is not None:
+                img_filename = f"{timestamp}_{user_id}_input_start_{i}.png"
+                img_path = os.path.join(base_save_dir, img_filename)
+                try:
+                    if hasattr(img, 'save'):  # PIL Image
+                        img.save(img_path)
+                    user_info["input_images"].append({
+                        "type": "start_image",
+                        "index": i,
+                        "path": img_path
+                    })
+                except Exception as e:
+                    print(f"Error saving start image {i}: {e}")
+    
+    if task_params.get("image_end"):
+        for i, img in enumerate(task_params["image_end"]):
+            if img is not None:
+                img_filename = f"{timestamp}_{user_id}_input_end_{i}.png"
+                img_path = os.path.join(base_save_dir, img_filename)
+                try:
+                    if hasattr(img, 'save'):  # PIL Image
+                        img.save(img_path)
+                    user_info["input_images"].append({
+                        "type": "end_image",
+                        "index": i,
+                        "path": img_path
+                    })
+                except Exception as e:
+                    print(f"Error saving end image {i}: {e}")
+    
+    # Save input videos information if available (for FL2V transition mode)
+    if task_params.get("video_source_start"):
+        user_info["input_videos"].append({
+            "type": "start_video",
+            "path": task_params["video_source_start"]
+        })
+    
+    if task_params.get("video_source_end"):
+        user_info["input_videos"].append({
+            "type": "end_video", 
+            "path": task_params["video_source_end"]
+        })
+    
+    # Save JSON file
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(user_info, f, ensure_ascii=False, indent=2)
+        print(f"User input information saved to: {json_path}")
+        return json_path
+    except Exception as e:
+        print(f"Error saving user input info: {e}")
+        return None
+
+# Move output video to classified directory
+def move_video_to_classified_dir(video_path, model_filename, user_id="default_user"):
+    """
+    Move generated video to the classified directory based on model type.
+    
+    Args:
+        video_path: Current path of the video file
+        model_filename: The model filename used
+        user_id: User identification
+        
+    Returns:
+        New path of the moved video file
+    """
+    from datetime import datetime
+    
+    if not os.path.exists(video_path):
+        return video_path
+    
+    # Classify model type
+    model_type = classify_model_type(model_filename)
+    
+    # Create target directory
+    target_dir = os.path.join(save_path, model_type)
+    os.makedirs(target_dir, exist_ok=True)
+    
+    # Generate new filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    original_filename = os.path.basename(video_path)
+    name, ext = os.path.splitext(original_filename)
+    new_filename = f"{timestamp}_{user_id}_{name}{ext}"
+    new_video_path = os.path.join(target_dir, new_filename)
+    
+    # Move the file
+    try:
+        import shutil
+        shutil.move(video_path, new_video_path)
+        print(f"Video moved to classified directory: {new_video_path}")
+        return new_video_path
+    except Exception as e:
+        print(f"Error moving video to classified directory: {e}")
+        return video_path
+
+
 def parse_keep_frames_video_guide(keep_frames, video_length):
         
     def absolute(n):
@@ -2421,9 +2645,8 @@ def generate_video(
     cfg_star_switch,
     cfg_zero_step,
     state,
-    model_filename,
-    transition_mode=False,
-    source_videos=None,
+    model_filename
+
 ):
     global wan_model, offloadobj, reload_needed
     gen = get_gen_info(state)
@@ -2986,6 +3209,45 @@ def generate_video(
                 print(f"New video saved to Path: "+video_path)
                 file_list.append(video_path)
                 send_cmd("output")
+                
+                # Save user input information and move video to classified directory
+                try:
+                    # Prepare task parameters for saving
+                    task_params = {
+                        "task_id": task_id,
+                        "prompt": prompt,
+                        "negative_prompt": negative_prompt,
+                        "resolution": resolution,
+                        "video_length": video_length,
+                        "seed": seed,
+                        "num_inference_steps": num_inference_steps,
+                        "guidance_scale": guidance_scale,
+                        "flow_shift": flow_shift,
+                        "image_prompt_type": image_prompt_type,
+                        "image_start": image_start,
+                        "image_end": image_end,
+                        "video_source": video_source,
+                        "video_source_start": state.get("video_source_start"),
+                        "video_source_end": state.get("video_source_end")
+                    }
+                    
+                    # Move video to classified directory
+                    user_id = state.get("user_id", "default_user")
+                    new_video_path = move_video_to_classified_dir(video_path, model_filename, user_id)
+                    
+                    # Update file list with new path
+                    if new_video_path != video_path:
+                        file_list[-1] = new_video_path
+                        
+                    # Save user input information
+                    json_path = save_user_input_info(model_filename, task_params, new_video_path, user_id)
+                    if json_path:
+                        print(f"User input information saved to: {json_path}")
+                        
+                except Exception as e:
+                    print(f"Error saving user information: {e}")
+                    # Continue with generation even if saving fails
+                
                 if sliding_window :
                     if max_frames_to_generate > 0 and extra_windows == 0:
                         current_length = sample.shape[1]
@@ -2998,45 +3260,6 @@ def generate_video(
     if temp_filename!= None and  os.path.isfile(temp_filename):
         os.remove(temp_filename)
     offload.unload_loras_from_model(trans)
-
-    # 处理转场模式
-    if transition_mode and source_videos and len(source_videos) >= 2:
-        try:
-            # 提取视频帧
-            send_cmd("status", "提取视频帧...")
-            last_frame_video1, _ = extract_video_frames(source_videos[0])
-            _, first_frame_video2 = extract_video_frames(source_videos[1])
-            
-            # 替换image_start和image_end
-            image_start = last_frame_video1
-            image_end = first_frame_video2
-            send_cmd("status", "视频帧提取完成")
-        except Exception as e:
-            send_cmd("error", f"提取视频帧失败: {str(e)}")
-            return
-    
-    # 如果是转场模式，合并视频 (移至生成完成后，确保在资源清理之前)
-    if transition_mode and source_videos and len(source_videos) >= 2 and video_path:
-        try:
-            send_cmd("status", "正在合并视频...")
-            # 生成输出文件名
-            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss")
-            merged_filename = f"merged_{timestamp}_{os.path.basename(video_path)}"
-            merged_path = os.path.join(save_path, merged_filename)
-            
-            # 合并视频
-            merged_video_path = merge_videos(
-                source_videos[0], 
-                video_path,  # 生成的转场视频
-                source_videos[1], 
-                merged_path
-            )
-            
-            # 将合并后的视频路径添加到文件列表
-            file_list.append(merged_video_path)
-            send_cmd("status", f"视频合并完成: {merged_video_path}")
-        except Exception as e:
-            send_cmd("error", f"合并视频失败: {str(e)}")
 
 def prepare_generate_video(state):    
     if state.get("validate_success",0) != 1:
@@ -4021,6 +4244,16 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                     image_end  = gr.Gallery(
                             label="Images as ending points for new videos", type ="pil", #file_types= "image", 
                             columns=[3], rows=[1], object_fit="contain", height="auto", selected_index=0, interactive= True, visible="E" in image_prompt_type_value, value= ui_defaults.get("image_end", None))
+
+                    # Add two video upload windows when using FLF2V_720p model
+                    is_flf2v_720p = "FLF2V_720p" in model_filename
+                    with gr.Column(visible=is_flf2v_720p):
+                        gr.Markdown("For creating transition videos between two videos:")
+                        with gr.Row():
+                            video_source_start = gr.Video(label="First Video", visible=True, value=ui_defaults.get("video_source_start", None))
+                            video_source_end = gr.Video(label="Second Video", visible=True, value=ui_defaults.get("video_source_end", None))
+                        transition_mode = gr.Checkbox(label="Enable Video Transition Mode", value=False, visible=is_flf2v_720p)
+                        download_combined_video = gr.Button("Generate & Download Combined Video", visible=False)
 
                     video_source = gr.Video(visible=False)
                     model_mode = gr.Dropdown(visible=False)
@@ -5260,122 +5493,3 @@ if __name__ == "__main__":
             url = "http://" + server_name 
         webbrowser.open(url + ":" + str(server_port), new = 0, autoraise = True)
     demo.launch(server_name=server_name, server_port=server_port, share=args.share, allowed_paths=[save_path])
-
-def extract_video_frames(video_path):
-    """
-    从视频中提取首帧和尾帧 (Ubuntu兼容版本)
-    """
-    import cv2
-    from PIL import Image
-    import numpy as np
-    import os
-    
-    # 确保使用绝对路径
-    video_path = os.path.abspath(video_path)
-    
-    # 在Ubuntu上，有时需要使用这种方式确保路径被正确识别
-    cap = cv2.VideoCapture(str(video_path))
-    
-    if not cap.isOpened():
-        raise ValueError(f"无法打开视频文件: {video_path}")
-    
-    # 获取首帧
-    ret, first_frame = cap.read()
-    if not ret:
-        raise ValueError(f"无法读取视频首帧: {video_path}")
-    
-    first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-    first_frame = Image.fromarray(first_frame)
-    
-    # 获取视频总帧数
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # 设置到最后一帧的前一个位置
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
-    ret, last_frame = cap.read()
-    
-    if not ret:
-        # 如果无法读取最后一帧，尝试倒数第二帧
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
-        ret, last_frame = cap.read()
-        if not ret:
-            raise ValueError(f"无法读取视频末尾帧: {video_path}")
-    
-    last_frame = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
-    last_frame = Image.fromarray(last_frame)
-    
-    cap.release()
-    return first_frame, last_frame
-
-def merge_videos(video1_path, transition_video_path, video2_path, output_path):
-    """
-    将两个视频和中间的转场视频合并为一个视频 (Ubuntu兼容版本)
-    """
-    import subprocess
-    import os
-    import tempfile
-    import shlex
-    
-    # 创建临时文件列表
-    list_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
-    
-    # 使用绝对路径并进行适当转义
-    video1_abs = os.path.abspath(video1_path)
-    transition_abs = os.path.abspath(transition_video_path)
-    video2_abs = os.path.abspath(video2_path)
-    
-    list_file.write(f"file '{video1_abs.replace("'", "\\'")}'\n".encode())
-    list_file.write(f"file '{transition_abs.replace("'", "\\'")}'\n".encode())
-    list_file.write(f"file '{video2_abs.replace("'", "\\'")}'\n".encode())
-    list_file.close()
-    
-    # 使用FFmpeg合并视频
-    cmd = [
-        "ffmpeg", "-y", 
-        "-f", "concat", 
-        "-safe", "0", 
-        "-i", list_file.name, 
-        "-c", "copy", 
-        output_path
-    ]
-    
-    # 使用更安全的subprocess调用方式
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        
-        if process.returncode != 0:
-            print(f"FFmpeg错误: {stderr.decode()}")
-            raise Exception(f"视频合并失败: {stderr.decode()}")
-    finally:
-        if os.path.exists(list_file.name):
-            os.unlink(list_file.name)
-    
-    return output_path
-
-def check_dependencies():
-    """检查系统依赖项是否已安装"""
-    import subprocess
-    import shutil
-    
-    # 检查FFmpeg
-    if shutil.which("ffmpeg") is None:
-        print("警告: 未找到FFmpeg，请使用以下命令安装:")
-        print("  sudo apt update && sudo apt install -y ffmpeg")
-        return False
-    
-    # 检查OpenCV
-    try:
-        import cv2
-    except ImportError:
-        print("警告: 未找到OpenCV，请使用以下命令安装:")
-        print("  pip install opencv-python")
-        return False
-    
-    return True
-
-# 在程序启动时调用
-if __name__ == "__main__":
-    if not check_dependencies():
-        print("请安装所需依赖后重试")
-        # 可以选择继续或退出
