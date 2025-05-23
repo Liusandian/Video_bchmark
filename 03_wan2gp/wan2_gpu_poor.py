@@ -2439,6 +2439,7 @@ def save_user_input_info(model_filename, task_params, output_video_path, user_id
         "timestamp": timestamp,
         "datetime": datetime.now().isoformat(),
         "user_id": user_id,
+        "employee_id": user_id,  # 工号信息，与user_id相同
         "model_name": model_filename,
         "model_type": model_type,
         "task_id": task_params.get("task_id", ""),
@@ -3231,8 +3232,10 @@ def generate_video(
                         "video_source_end": state.get("video_source_end")
                     }
                     
+                    # Get user_id from state, use default if not set
+                    user_id = state.get("user_id", "000123456")
+                    
                     # Move video to classified directory
-                    user_id = state.get("user_id", "default_user")
                     new_video_path = move_video_to_classified_dir(video_path, model_filename, user_id)
                     
                     # Update file list with new path
@@ -3898,6 +3901,7 @@ def save_inputs(
             slg_end_perc,
             cfg_star_switch,
             cfg_zero_step,
+            user_id,
             state,
 ):
 
@@ -4381,7 +4385,31 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
             with gr.Row():                                            
                 num_inference_steps = gr.Slider(1, 100, value=ui_defaults.get("num_inference_steps",30), step=1, label="Number of Inference Steps")
 
+            # Add User ID input field
+            with gr.Row():
+                user_id = gr.Textbox(
+                    label="工号 (User ID)", 
+                    value=ui_defaults.get("user_id", "000123456"), 
+                    placeholder="请输入工号，默认：000123456",
+                    interactive=True,
+                    scale=1,
+                    max_lines=1
+                )
 
+            # Function to update user_id in state
+            def update_user_id_in_state(state, new_user_id):
+                if state is None:
+                    state = {}
+                state["user_id"] = new_user_id
+                return state
+
+            # Connect user_id input to state
+            if not update_form:
+                user_id.change(
+                    fn=update_user_id_in_state,
+                    inputs=[state, user_id],
+                    outputs=[state]
+                )
 
             show_advanced = gr.Checkbox(label="Advanced Mode", value=advanced_ui)
             with gr.Tabs(visible=advanced_ui) as advanced_row:
