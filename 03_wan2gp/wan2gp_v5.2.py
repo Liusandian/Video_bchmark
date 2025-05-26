@@ -3028,7 +3028,7 @@ def generate_video(
                 )
                 print(f"Enhanced prompts: {prompts}" )
                 task["prompt"] = "\n".join(["!enhanced!"] + prompts)
-                send_cmd("output")
+        send_cmd("output")
                 prompt = prompts[0]
                 abort = gen.get("abort", False)
 
@@ -3351,6 +3351,28 @@ def generate_video(
 
                 print(f"New video saved to Path: "+video_path)
                 file_list.append(video_path)
+                
+                # 处理视频转场融合
+                if video_transition_mode and original_video_start is not None and original_video_end is not None:
+                    send_cmd("progress", [0, get_latest_status(state, "Merging videos with transition")])
+                    
+                    # 生成融合后的视频文件名
+                    transition_file_name = f"{time_flag}_seed{seed}_transition_{sanitize_file_name(save_prompt[:50]).strip()}.mp4"
+                    transition_video_path = os.path.join(save_path, transition_file_name)
+                    
+                    # 调用视频融合函数
+                    merge_videos_with_transition(original_video_start, video_path, original_video_end, transition_video_path)
+                    
+                    # 更新文件列表，使用融合后的视频
+                    file_list[-1] = transition_video_path
+                    print(f"Transition video saved to Path: "+transition_video_path)
+                    
+                    send_cmd("output")
+                
+                send_cmd("output")
+
+        seed += 1
+    clear_status(state)
                 send_cmd("output")
 
         seed += 1
@@ -4156,6 +4178,8 @@ def save_inputs(
             image_prompt_type,
             image_start,
             image_end,
+            video_start,
+            video_end,
             model_mode,
             video_source,
             keep_frames_video_source,
@@ -4172,7 +4196,7 @@ def save_inputs(
             remove_background_images_ref,
             temporal_upsampling,
             spatial_upsampling,
-            RIFLEx_setting,
+            RIFLEx_setting, 
             slg_switch, 
             slg_layers,
             slg_start_perc,
@@ -4180,8 +4204,8 @@ def save_inputs(
             cfg_star_switch,
             cfg_zero_step,
             prompt_enhancer,
-            state,
-):
+            state
+        ):
 
   
     # if state.get("validate_success",0) != 1:
@@ -4627,7 +4651,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                 outputs= None
             ).then(fn=process_prompt_and_add_tasks,
                 inputs = [state, model_choice],
-                outputs= queue_df
+                outputs=queue_df
             ).then(fn=prepare_generate_video,
                 inputs= [state],
                 outputs= [generate_btn, add_to_queue_btn, current_gen_column]
