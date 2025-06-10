@@ -74,7 +74,13 @@ def i2v_background(dream_model, video_pair_list, device):
 
 def compute_i2v_background(json_dir, device, submodules_list, **kwargs):
     
-    dream_model, preprocess = dreamsim(pretrained=True)
+    try:
+        dream_model, preprocess = dreamsim(pretrained=True)
+    except:
+        # workaround for CERTIFICATE_VERIFY_FAILED (see: https://github.com/pytorch/pytorch/issues/33288#issuecomment-954160699)
+        import ssl
+        ssl._create_default_https_context = ssl._create_unverified_context
+        dream_model, preprocess = dreamsim(pretrained=True)
     
     resolution = submodules_list['resolution']
     logger.info("Initialize DreamSim success")
