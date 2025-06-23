@@ -235,12 +235,192 @@ class CameraPredict:
             else:
                 self.visualize_and_save_tracks(video, pred_tracks, pred_visibility, output_path, fps)
             
-            return pred_tracks[0].long().detach().cpu().numpy()
+            return pred_tracks[0].long().detach().cpu().numpy(), pred_visibility[0].detach().cpu().numpy()
             
         if end_frame!=-1:
             pred_tracks = pred_tracks[:,:end_frame]
             pred_visibility = pred_visibility[:,:end_frame]
-        return pred_tracks[0].long().detach().cpu().numpy()
+        return pred_tracks[0].long().detach().cpu().numpy(), pred_visibility[0].detach().cpu().numpy()
+    
+    def find_stable_feature_points(self, pred_visibility, threshold=0.8):
+        """
+        找到在threshold比例以上的帧中都可见的稳定特征点
+        
+        Args:
+            pred_visibility: (T, N) 可见性矩阵
+            threshold: 可见性阈值，0.8表示在80%以上的帧中可见
+            
+        Returns:
+            stable_point_ids: 稳定特征点的ID列表
+        """
+        T, N = pred_visibility.shape
+        
+        # 计算每个特征点的可见性比例 (大于0.5认为可见)
+        visibility_ratio = np.mean(pred_visibility > 0.5, axis=0)  # (N,)
+        
+        # 找到可见性比例大于阈值的特征点
+        stable_point_ids = np.where(visibility_ratio >= threshold)[0]
+        
+        print(f"总特征点数: {N}, 稳定特征点数: {len(stable_point_ids)} ({len(stable_point_ids)/N*100:.1f}%)")
+        print(f"稳定特征点可见性统计: min={visibility_ratio[stable_point_ids].min():.2f}, "
+              f"max={visibility_ratio[stable_point_ids].max():.2f}, "
+              f"mean={visibility_ratio[stable_point_ids].mean():.2f}")
+        
+        return stable_point_ids
+    
+    def analyze_zoom_motion(self, pred_tracks, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        基于稳定特征点分析zoom运动
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            zoom_type: 'zoom_in', 'zoom_out', 'static', 'complex'
+            motion_details: 详细运动信息
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+            
+        if len(stable_point_ids) == 0:
+            return 'static', {'reason': 'no_stable_points'}
+        
+        # 获取稳定特征点的初始和最终位置
+        initial_points = pred_tracks[first_frame, stable_point_ids]  # (N_stable, 2)
+        final_points = pred_tracks[last_frame, stable_point_ids]     # (N_stable, 2)
+        
+        # 计算图像中心
+        center_x, center_y = self.width / 2, self.height / 2
+        
+        # 计算每个点到中心的初始距离和最终距离
+        initial_distances = np.sqrt((initial_points[:, 0] - center_x)**2 + 
+                                  (initial_points[:, 1] - center_y)**2)
+        final_distances = np.sqrt((final_points[:, 0] - center_x)**2 + 
+                                (final_points[:, 1] - center_y)**2)
+        
+        # 计算距离变化
+        distance_changes = final_distances - initial_distances
+        
+        # 分析边缘点和中心点的运动模式
+        # 将点按距离中心的远近分为边缘点和中心点
+        center_distance_threshold = min(self.width, self.height) * 0.3
+        edge_point_mask = initial_distances > center_distance_threshold
+        
+        edge_distance_changes = distance_changes[edge_point_mask] if np.any(edge_point_mask) else np.array([])
+        center_distance_changes = distance_changes[~edge_point_mask] if np.any(~edge_point_mask) else np.array([])
+        
+        # 统计运动方向
+        zoom_out_ratio = np.mean(distance_changes > self.scale * 0.02) if len(distance_changes) > 0 else 0
+        zoom_in_ratio = np.mean(distance_changes < -self.scale * 0.02) if len(distance_changes) > 0 else 0
+        static_ratio = 1 - zoom_out_ratio - zoom_in_ratio
+        
+        # 边缘点的运动分析（更重要）
+        edge_zoom_out_ratio = np.mean(edge_distance_changes > self.scale * 0.02) if len(edge_distance_changes) > 0 else 0
+        edge_zoom_in_ratio = np.mean(edge_distance_changes < -self.scale * 0.02) if len(edge_distance_changes) > 0 else 0
+        
+        motion_details = {
+            'total_stable_points': len(stable_point_ids),
+            'edge_points': np.sum(edge_point_mask),
+            'center_points': np.sum(~edge_point_mask),
+            'zoom_out_ratio': zoom_out_ratio,
+            'zoom_in_ratio': zoom_in_ratio,
+            'static_ratio': static_ratio,
+            'edge_zoom_out_ratio': edge_zoom_out_ratio,
+            'edge_zoom_in_ratio': edge_zoom_in_ratio,
+            'mean_distance_change': np.mean(distance_changes),
+            'edge_mean_distance_change': np.mean(edge_distance_changes) if len(edge_distance_changes) > 0 else 0
+        }
+        
+        # 判断运动类型
+        confidence_threshold = 0.6  # 至少60%的点要有一致的运动
+        
+        # 优先基于边缘点判断，因为边缘点对zoom运动更敏感
+        if len(edge_distance_changes) > 0:
+            if edge_zoom_out_ratio >= confidence_threshold:
+                zoom_type = 'zoom_out'
+            elif edge_zoom_in_ratio >= confidence_threshold:
+                zoom_type = 'zoom_in'
+            elif edge_zoom_out_ratio + edge_zoom_in_ratio < 0.3:  # 大部分边缘点静止
+                zoom_type = 'static'
+            else:
+                zoom_type = 'complex'
+        else:
+            # 如果没有边缘点，则基于全部点判断
+            if zoom_out_ratio >= confidence_threshold:
+                zoom_type = 'zoom_out'
+            elif zoom_in_ratio >= confidence_threshold:
+                zoom_type = 'zoom_in'
+            elif static_ratio >= confidence_threshold:
+                zoom_type = 'static'
+            else:
+                zoom_type = 'complex'
+        
+        return zoom_type, motion_details
+    
+    def analyze_pan_tilt_motion(self, pred_tracks, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        分析pan和tilt运动
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            motion_type: pan/tilt运动类型
+            motion_details: 详细运动信息
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+            
+        if len(stable_point_ids) == 0:
+            return 'static', {'reason': 'no_stable_points'}
+        
+        # 获取稳定特征点的运动向量
+        initial_points = pred_tracks[first_frame, stable_point_ids]  # (N_stable, 2)
+        final_points = pred_tracks[last_frame, stable_point_ids]     # (N_stable, 2)
+        
+        # 计算运动向量
+        motion_vectors = final_points - initial_points  # (N_stable, 2)
+        
+        # 计算平均运动向量
+        mean_motion_x = np.mean(motion_vectors[:, 0])
+        mean_motion_y = np.mean(motion_vectors[:, 1])
+        
+        # 设置运动阈值
+        motion_threshold = self.scale * 0.02
+        
+        motion_details = {
+            'mean_motion_x': mean_motion_x,
+            'mean_motion_y': mean_motion_y,
+            'motion_magnitude': np.sqrt(mean_motion_x**2 + mean_motion_y**2),
+            'consistent_x_ratio': np.mean(np.sign(motion_vectors[:, 0]) == np.sign(mean_motion_x)),
+            'consistent_y_ratio': np.mean(np.sign(motion_vectors[:, 1]) == np.sign(mean_motion_y))
+        }
+        
+        # 判断运动类型
+        motion_results = []
+        
+        if abs(mean_motion_x) > motion_threshold:
+            if mean_motion_x > 0:
+                motion_results.append('pan_right')
+            else:
+                motion_results.append('pan_left')
+        
+        if abs(mean_motion_y) > motion_threshold:
+            if mean_motion_y > 0:
+                motion_results.append('tilt_down')
+            else:
+                motion_results.append('tilt_up')
+        
+        if not motion_results:
+            motion_results.append('static')
+        
+        return motion_results, motion_details
     
     def get_edge_point(self, track):
         middle = self.grid_size // 2
@@ -349,14 +529,76 @@ class CameraPredict:
         return results
     
     def predict(self, video, fps, end_frame):
-        pred_track = self.infer(video, fps, end_frame)
-        track1 = pred_track[0].reshape((self.grid_size, self.grid_size, 2))
-        track2 = pred_track[-1].reshape((self.grid_size, self.grid_size, 2))
-        tracks=[pred_track[i].reshape(self.grid_size, self.grid_size, 2) for i in range(0, len(pred_track), 20)]
-        results = self.camera_classify(track1, track2, tracks)
+        pred_track, pred_visibility = self.infer(video, fps, end_frame)
+        
+        # 使用新的稳定特征点分析方法
+        results = self.predict_with_stable_points(pred_track, pred_visibility)
+        
+        # 保持与原有方法的兼容性，如果新方法没有检测到运动，则使用原有方法
+        if results == ['static'] or not results:
+            track1 = pred_track[0].reshape((self.grid_size, self.grid_size, 2))
+            track2 = pred_track[-1].reshape((self.grid_size, self.grid_size, 2))
+            tracks=[pred_track[i].reshape(self.grid_size, self.grid_size, 2) for i in range(0, len(pred_track), 20)]
+            results = self.camera_classify(track1, track2, tracks)
 
         return results
     
+    def predict_with_stable_points(self, pred_tracks, pred_visibility, stability_threshold=0.8):
+        """
+        基于稳定特征点的相机运动预测
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            stability_threshold: 稳定性阈值，默认0.8（80%）
+            
+        Returns:
+            results: 检测到的相机运动类型列表
+        """
+        # 1. 找到稳定的特征点
+        stable_point_ids = self.find_stable_feature_points(pred_visibility, stability_threshold)
+        
+        if len(stable_point_ids) == 0:
+            print("未找到稳定的特征点，无法进行运动分析")
+            return ['static']
+        
+        results = []
+        
+        # 2. 分析zoom运动（优先级最高，因为最明显）
+        zoom_type, zoom_details = self.analyze_zoom_motion(pred_tracks, stable_point_ids)
+        print(f"Zoom分析结果: {zoom_type}")
+        print(f"Zoom详细信息: {zoom_details}")
+        
+        if zoom_type in ['zoom_in', 'zoom_out']:
+            results.append(zoom_type)
+        
+        # 3. 分析pan/tilt运动
+        pan_tilt_types, pan_tilt_details = self.analyze_pan_tilt_motion(pred_tracks, stable_point_ids)
+        print(f"Pan/Tilt分析结果: {pan_tilt_types}")
+        print(f"Pan/Tilt详细信息: {pan_tilt_details}")
+        
+        # 过滤掉静态运动，除非没有其他运动
+        non_static_pan_tilt = [t for t in pan_tilt_types if t != 'static']
+        if non_static_pan_tilt:
+            results.extend(non_static_pan_tilt)
+        elif not results:  # 如果zoom也是静态的，则添加static
+            results.append('static')
+        
+        # 4. 检测复杂运动组合
+        if len(results) > 1:
+            # 检查是否存在oblique运动（zoom + tilt的组合）
+            has_zoom = any(r in ['zoom_in', 'zoom_out'] for r in results)
+            has_tilt = any(r in ['tilt_up', 'tilt_down'] for r in results)
+            if has_zoom and has_tilt:
+                results.append('oblique')
+        
+        # 5. 去重并过滤
+        results = list(set(results))
+        if 'static' in results and len(results) > 1:
+            results.remove('static')
+        
+        return results if results else ['static']
+
 def visualize_camera_motion(video_path, output_dir="./visualizations", device="cuda", submodules_dict=None, visualization_type="grid"):
     """
     独立的可视化函数，用于可视化视频中的CoTracker特征点
@@ -439,6 +681,95 @@ def camera_motion(prompt_dict_ls, camera, save_visualizations=False, vis_output_
     
     avg_score = np.mean(sim)
     return avg_score, video_results
+
+def test_stable_point_analysis(video_path, output_dir="./test_analysis", device="cuda", stability_threshold=0.8):
+    """
+    测试稳定特征点分析功能
+    
+    Args:
+        video_path: 输入视频路径
+        output_dir: 输出目录
+        device: 设备类型
+        stability_threshold: 稳定性阈值
+    """
+    import decord
+    
+    # 默认模型配置
+    submodules_dict = {
+        "repo": "facebookresearch/co-tracker",
+        "model": "cotracker2_online"
+    }
+    
+    # 创建相机预测器
+    camera = CameraPredict(device, submodules_dict)
+    
+    # 读取视频
+    video_reader = decord.VideoReader(video_path)
+    video = video_reader.get_batch(range(len(video_reader)))
+    video = video.permute(0, 3, 1, 2)[None].float()
+    
+    if device == "cuda":
+        video = video.cuda()
+    
+    # 获取视频信息
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    cap.release()
+    
+    print(f"开始分析视频: {video_path}")
+    print(f"视频尺寸: {video.shape}")
+    print(f"FPS: {fps}")
+    
+    # 进行预测和分析
+    pred_tracks, pred_visibility = camera.infer(video, fps=fps, save_video=False)
+    
+    print(f"\n=== 轨迹数据统计 ===")
+    print(f"轨迹形状: {pred_tracks.shape}")  # (T, N, 2)
+    print(f"可见性形状: {pred_visibility.shape}")  # (T, N)
+    
+    # 分析稳定特征点
+    stable_point_ids = camera.find_stable_feature_points(pred_visibility, stability_threshold)
+    
+    if len(stable_point_ids) > 0:
+        print(f"\n=== 运动分析结果 ===")
+        
+        # Zoom运动分析
+        zoom_type, zoom_details = camera.analyze_zoom_motion(pred_tracks, stable_point_ids)
+        print(f"Zoom运动类型: {zoom_type}")
+        print(f"Zoom运动详情:")
+        for key, value in zoom_details.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
+        
+        # Pan/Tilt运动分析
+        pan_tilt_types, pan_tilt_details = camera.analyze_pan_tilt_motion(pred_tracks, stable_point_ids)
+        print(f"\nPan/Tilt运动类型: {pan_tilt_types}")
+        print(f"Pan/Tilt运动详情:")
+        for key, value in pan_tilt_details.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
+        
+        # 综合分析结果
+        final_results = camera.predict_with_stable_points(pred_tracks, pred_visibility, stability_threshold)
+        print(f"\n=== 最终运动分类结果 ===")
+        print(f"检测到的相机运动类型: {final_results}")
+        
+    else:
+        print("未找到稳定的特征点，无法进行详细分析")
+    
+    # 可选：保存可视化结果
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        vis_output_path = os.path.join(output_dir, "stable_point_visualization.mp4")
+        camera.visualize_grid_tracks(video, 
+                                   torch.tensor(pred_tracks)[None], 
+                                   torch.tensor(pred_visibility)[None], 
+                                   vis_output_path, fps)
+        print(f"\n可视化结果已保存到: {vis_output_path}")
 
 def compute_camera_motion(json_dir, device, submodules_dict, save_visualizations=False, **kwargs):
     camera = CameraPredict(device, submodules_dict)
