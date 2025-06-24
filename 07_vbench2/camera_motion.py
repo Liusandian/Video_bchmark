@@ -434,6 +434,78 @@ class CameraPredict:
         right = [list(track[i, self.grid_size-idx-1, :]) for i in range(start, end)]
         return top, down, left, right
     
+    def get_edge_point_from_stable_points(self, pred_tracks, stable_point_ids, frame_idx):
+        """
+        从稳定特征点中提取边缘区域的点
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            stable_point_ids: 稳定特征点ID列表
+            frame_idx: 帧索引
+            
+        Returns:
+            top, down, left, right: 四个边缘区域的点列表
+        """
+        # 获取指定帧的稳定特征点坐标
+        stable_points = pred_tracks[frame_idx, stable_point_ids, :]  # (N_stable, 2)
+        
+        # 定义边缘区域的阈值
+        edge_threshold = min(self.width, self.height) * 0.15  # 边缘区域阈值
+        
+        # 根据位置将点分类到不同边缘区域
+        top_points = []
+        down_points = []
+        left_points = []
+        right_points = []
+        
+        for point in stable_points:
+            x, y = point[0], point[1]
+            
+            # 检查是否在顶部边缘
+            if y <= edge_threshold:
+                top_points.append([float(x), float(y)])
+            
+            # 检查是否在底部边缘  
+            if y >= self.height - edge_threshold:
+                down_points.append([float(x), float(y)])
+            
+            # 检查是否在左侧边缘
+            if x <= edge_threshold:
+                left_points.append([float(x), float(y)])
+            
+            # 检查是否在右侧边缘
+            if x >= self.width - edge_threshold:
+                right_points.append([float(x), float(y)])
+        
+        # 如果某个边缘区域点数不足，使用最近的点补充
+        min_points_per_edge = 2
+        
+        if len(top_points) < min_points_per_edge:
+            # 找到Y坐标最小的点作为顶部点
+            y_coords = stable_points[:, 1]
+            top_indices = np.argsort(y_coords)[:min_points_per_edge]
+            top_points = [[float(stable_points[i, 0]), float(stable_points[i, 1])] for i in top_indices]
+        
+        if len(down_points) < min_points_per_edge:
+            # 找到Y坐标最大的点作为底部点
+            y_coords = stable_points[:, 1]
+            down_indices = np.argsort(y_coords)[-min_points_per_edge:]
+            down_points = [[float(stable_points[i, 0]), float(stable_points[i, 1])] for i in down_indices]
+        
+        if len(left_points) < min_points_per_edge:
+            # 找到X坐标最小的点作为左侧点
+            x_coords = stable_points[:, 0]
+            left_indices = np.argsort(x_coords)[:min_points_per_edge]
+            left_points = [[float(stable_points[i, 0]), float(stable_points[i, 1])] for i in left_indices]
+        
+        if len(right_points) < min_points_per_edge:
+            # 找到X坐标最大的点作为右侧点
+            x_coords = stable_points[:, 0]
+            right_indices = np.argsort(x_coords)[-min_points_per_edge:]
+            right_points = [[float(stable_points[i, 0]), float(stable_points[i, 1])] for i in right_indices]
+        
+        return top_points, down_points, left_points, right_points
+    
     def get_edge_point_360(self, track):
         middle = self.grid_size // 2
         number = 2
@@ -482,6 +554,58 @@ class CameraPredict:
         vector_results_pan = list(map(transform, vector_results)) 
         class_results = [transform_class(vector, min_reso=self.scale) for vector in vector_results_pan]
         return class_results
+    
+    def get_edge_direction_from_stable_points(self, pred_tracks, stable_point_ids, frame1_idx, frame2_idx):
+        """
+        基于稳定特征点分析边缘区域的运动方向
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            stable_point_ids: 稳定特征点ID列表
+            frame1_idx: 起始帧索引
+            frame2_idx: 结束帧索引
+            
+        Returns:
+            class_results: 四个边缘区域的运动分类结果
+        """
+        # 获取两帧的边缘点
+        edge_points1 = self.get_edge_point_from_stable_points(pred_tracks, stable_point_ids, frame1_idx)
+        edge_points2 = self.get_edge_point_from_stable_points(pred_tracks, stable_point_ids, frame2_idx)
+        
+        vector_results = []
+        
+        # 计算每个边缘区域的运动向量
+        for points1, points2 in zip(edge_points1, edge_points2):
+            if len(points1) == 0 or len(points2) == 0:
+                # 如果某个边缘区域没有点，跳过
+                vector_results.append([])
+                continue
+                
+            # 计算运动向量（使用最近邻匹配或简单的对应关系）
+            vectors = []
+            min_len = min(len(points1), len(points2))
+            
+            for i in range(min_len):
+                start = points1[i]
+                end = points2[i]
+                vector = [end[0] - start[0], end[1] - start[1], start[1]]
+                vectors.append(vector)
+            
+            vector_results.append(vectors)
+        
+        # 转换为平均运动向量
+        vector_results_pan = []
+        for vectors in vector_results:
+            if len(vectors) > 0:
+                avg_vector = transform(vectors)
+                vector_results_pan.append(avg_vector)
+            else:
+                vector_results_pan.append([0, 0])  # 无运动
+        
+        # 分类运动方向
+        class_results = [transform_class(vector, min_reso=self.scale) for vector in vector_results_pan]
+        
+        return class_results
 
     def classify_top_down(self, top, down):
         results = []
@@ -528,6 +652,48 @@ class CameraPredict:
             results.remove("None")  
         return results
     
+    def camera_classify_from_stable_points(self, pred_tracks, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        基于稳定特征点进行相机运动分类
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧索引
+            last_frame: 结束帧索引
+            
+        Returns:
+            results: 检测到的相机运动类型列表
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+            
+        if len(stable_point_ids) == 0:
+            return ['static']
+        
+        # 使用边缘点分析运动方向
+        top, down, left, right = self.get_edge_direction_from_stable_points(
+            pred_tracks, stable_point_ids, first_frame, last_frame)
+        
+        # 分析上下边缘和左右边缘的运动模式
+        top_results = self.classify_top_down(top, down)
+        left_results = self.classify_left_right(left, right)
+        
+        # 合并结果
+        results = list(set(top_results + left_results))
+        
+        # 处理特殊组合
+        if "tilt_up" in results and "zoom_in" in results:
+            results.append("oblique")
+        
+        # 清理结果
+        if "static" in results and len(results) > 1:
+            results.remove("static")
+        if "None" in results and len(results) > 1:
+            results.remove("None")
+        
+        return results if results else ["static"]
+    
     def predict(self, video, fps, end_frame):
         pred_track, pred_visibility = self.infer(video, fps, end_frame)
         
@@ -564,35 +730,41 @@ class CameraPredict:
         
         results = []
         
-        # 2. 分析zoom运动（优先级最高，因为最明显）
+        # 2. 使用新的边缘点分析方法（解决reshape维度问题）
+        edge_results = self.camera_classify_from_stable_points(pred_tracks, stable_point_ids)
+        print(f"边缘点分析结果: {edge_results}")
+        
+        if edge_results and edge_results != ['static']:
+            results.extend(edge_results)
+        
+        # 3. 分析zoom运动（作为补充验证）
         zoom_type, zoom_details = self.analyze_zoom_motion(pred_tracks, stable_point_ids)
         print(f"Zoom分析结果: {zoom_type}")
         print(f"Zoom详细信息: {zoom_details}")
         
-        if zoom_type in ['zoom_in', 'zoom_out']:
+        if zoom_type in ['zoom_in', 'zoom_out'] and zoom_type not in results:
             results.append(zoom_type)
         
-        # 3. 分析pan/tilt运动
+        # 4. 分析pan/tilt运动（作为补充验证）
         pan_tilt_types, pan_tilt_details = self.analyze_pan_tilt_motion(pred_tracks, stable_point_ids)
         print(f"Pan/Tilt分析结果: {pan_tilt_types}")
         print(f"Pan/Tilt详细信息: {pan_tilt_details}")
         
-        # 过滤掉静态运动，除非没有其他运动
+        # 过滤掉静态运动，并与边缘分析结果融合
         non_static_pan_tilt = [t for t in pan_tilt_types if t != 'static']
-        if non_static_pan_tilt:
-            results.extend(non_static_pan_tilt)
-        elif not results:  # 如果zoom也是静态的，则添加static
-            results.append('static')
+        for motion_type in non_static_pan_tilt:
+            if motion_type not in results:
+                results.append(motion_type)
         
-        # 4. 检测复杂运动组合
+        # 5. 检测复杂运动组合
         if len(results) > 1:
             # 检查是否存在oblique运动（zoom + tilt的组合）
             has_zoom = any(r in ['zoom_in', 'zoom_out'] for r in results)
             has_tilt = any(r in ['tilt_up', 'tilt_down'] for r in results)
-            if has_zoom and has_tilt:
+            if has_zoom and has_tilt and 'oblique' not in results:
                 results.append('oblique')
         
-        # 5. 去重并过滤
+        # 6. 去重并过滤
         results = list(set(results))
         if 'static' in results and len(results) > 1:
             results.remove('static')
@@ -681,6 +853,92 @@ def camera_motion(prompt_dict_ls, camera, save_visualizations=False, vis_output_
     
     avg_score = np.mean(sim)
     return avg_score, video_results
+
+def test_stable_point_edge_analysis(video_path, output_dir="./test_analysis", device="cuda", stability_threshold=0.8):
+    """
+    测试新的稳定特征点边缘分析功能（解决reshape维度问题）
+    
+    Args:
+        video_path: 输入视频路径
+        output_dir: 输出目录
+        device: 设备类型
+        stability_threshold: 稳定性阈值
+    """
+    import decord
+    
+    # 默认模型配置
+    submodules_dict = {
+        "repo": "facebookresearch/co-tracker",
+        "model": "cotracker2_online"
+    }
+    
+    # 创建相机预测器
+    camera = CameraPredict(device, submodules_dict)
+    
+    # 读取视频
+    video_reader = decord.VideoReader(video_path)
+    video = video_reader.get_batch(range(len(video_reader)))
+    video = video.permute(0, 3, 1, 2)[None].float()
+    
+    if device == "cuda":
+        video = video.cuda()
+    
+    # 获取视频信息
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    cap.release()
+    
+    print(f"开始分析视频: {video_path}")
+    print(f"视频尺寸: {video.shape}")
+    print(f"FPS: {fps}")
+    
+    # 进行预测和分析
+    pred_tracks, pred_visibility = camera.infer(video, fps=fps, save_video=False)
+    
+    print(f"\n=== 轨迹数据统计 ===")
+    print(f"轨迹形状: {pred_tracks.shape}")  # (T, N, 2)
+    print(f"可见性形状: {pred_visibility.shape}")  # (T, N)
+    
+    # 分析稳定特征点
+    stable_point_ids = camera.find_stable_feature_points(pred_visibility, stability_threshold)
+    
+    if len(stable_point_ids) > 0:
+        print(f"\n=== 新边缘点分析方法测试 ===")
+        
+        # 测试新的边缘点提取
+        edge_points = camera.get_edge_point_from_stable_points(pred_tracks, stable_point_ids, 0)
+        print(f"边缘点数量统计:")
+        print(f"  顶部: {len(edge_points[0])}")
+        print(f"  底部: {len(edge_points[1])}")
+        print(f"  左侧: {len(edge_points[2])}")
+        print(f"  右侧: {len(edge_points[3])}")
+        
+        # 测试边缘运动方向分析
+        edge_directions = camera.get_edge_direction_from_stable_points(
+            pred_tracks, stable_point_ids, 0, -1)
+        print(f"边缘运动方向: {edge_directions}")
+        
+        # 测试新的相机分类方法
+        camera_results = camera.camera_classify_from_stable_points(pred_tracks, stable_point_ids)
+        print(f"边缘点分析结果: {camera_results}")
+        
+        # 测试完整的稳定点预测
+        final_results = camera.predict_with_stable_points(pred_tracks, pred_visibility, stability_threshold)
+        print(f"\n=== 最终运动分类结果 ===")
+        print(f"检测到的相机运动类型: {final_results}")
+        
+    else:
+        print("未找到稳定的特征点，无法进行详细分析")
+    
+    # 可选：保存可视化结果
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        vis_output_path = os.path.join(output_dir, "edge_analysis_visualization.mp4")
+        camera.visualize_grid_tracks(video, 
+                                   torch.tensor(pred_tracks)[None], 
+                                   torch.tensor(pred_visibility)[None], 
+                                   vis_output_path, fps)
+        print(f"\n可视化结果已保存到: {vis_output_path}")
 
 def test_stable_point_analysis(video_path, output_dir="./test_analysis", device="cuda", stability_threshold=0.8):
     """
