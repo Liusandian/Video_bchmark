@@ -422,6 +422,365 @@ class CameraPredict:
         
         return motion_results, motion_details
     
+    def detect_subject(self, pred_tracks, pred_visibility, frame_idx=0):
+        """
+        检测画面中的主体区域
+        基于特征点密度和中心位置来识别主体
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            frame_idx: 分析的帧索引
+            
+        Returns:
+            subject_points: 主体区域的特征点ID列表
+            subject_center: 主体中心坐标
+            subject_bbox: 主体边界框
+        """
+        # 获取当前帧的可见特征点
+        visible_mask = pred_visibility[frame_idx] > 0.5
+        visible_points = pred_tracks[frame_idx, visible_mask]
+        visible_ids = np.where(visible_mask)[0]
+        
+        if len(visible_points) == 0:
+            return [], None, None
+        
+        # 计算图像中心区域（假设主体通常在中心）
+        center_x, center_y = self.width / 2, self.height / 2
+        center_region_ratio = 0.6  # 中心区域占比
+        
+        center_width = self.width * center_region_ratio
+        center_height = self.height * center_region_ratio
+        
+        # 找到中心区域的特征点
+        center_mask = (
+            (visible_points[:, 0] >= center_x - center_width/2) &
+            (visible_points[:, 0] <= center_x + center_width/2) &
+            (visible_points[:, 1] >= center_y - center_height/2) &
+            (visible_points[:, 1] <= center_y + center_height/2)
+        )
+        
+        center_points = visible_points[center_mask]
+        center_point_ids = visible_ids[center_mask]
+        
+        if len(center_points) == 0:
+            # 如果中心区域没有点，使用密度最高的区域
+            from scipy import spatial
+            if len(visible_points) > 3:
+                # 使用KD树找到密度最高的区域
+                tree = spatial.cKDTree(visible_points)
+                distances, indices = tree.query(visible_points, k=min(5, len(visible_points)))
+                density_scores = 1.0 / (np.mean(distances, axis=1) + 1e-6)
+                
+                # 选择密度最高的点作为主体中心
+                center_idx = np.argmax(density_scores)
+                subject_center = visible_points[center_idx]
+                
+                # 选择周围的点作为主体
+                radius = min(self.width, self.height) * 0.2
+                distances_to_center = np.sqrt(np.sum((visible_points - subject_center)**2, axis=1))
+                subject_mask = distances_to_center <= radius
+                
+                subject_points = visible_ids[subject_mask]
+                subject_center = np.mean(visible_points[subject_mask], axis=0)
+            else:
+                subject_points = visible_ids
+                subject_center = np.mean(visible_points, axis=0)
+        else:
+            subject_points = center_point_ids
+            subject_center = np.mean(center_points, axis=0)
+        
+        # 计算主体边界框
+        if len(subject_points) > 0:
+            subject_coords = pred_tracks[frame_idx, subject_points]
+            min_x, min_y = np.min(subject_coords, axis=0)
+            max_x, max_y = np.max(subject_coords, axis=0)
+            subject_bbox = [min_x, min_y, max_x, max_y]
+        else:
+            subject_bbox = None
+        
+        return subject_points, subject_center, subject_bbox
+    
+    def analyze_perspective_change(self, pred_tracks, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        分析透视变化，这是dolly运动的关键特征
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            perspective_change: 透视变化指标
+            depth_layers: 深度层次分析结果
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+            
+        if len(stable_point_ids) == 0:
+            return None, None
+        
+        # 获取起始和结束帧的特征点位置
+        initial_points = pred_tracks[first_frame, stable_point_ids]
+        final_points = pred_tracks[last_frame, stable_point_ids]
+        
+        # 计算图像中心
+        center_x, center_y = self.width / 2, self.height / 2
+        center = np.array([center_x, center_y])
+        
+        # 计算每个点到中心的距离和角度
+        initial_distances = np.sqrt(np.sum((initial_points - center)**2, axis=1))
+        final_distances = np.sqrt(np.sum((final_points - center)**2, axis=1))
+        
+        # 计算运动向量
+        motion_vectors = final_points - initial_points
+        motion_magnitudes = np.sqrt(np.sum(motion_vectors**2, axis=1))
+        
+        # 分析径向运动模式（dolly运动的特征）
+        initial_directions = (initial_points - center) / (initial_distances[:, np.newaxis] + 1e-6)
+        radial_motion = np.sum(motion_vectors * initial_directions, axis=1)
+        
+        # 按距离中心的远近分层（近景、中景、远景）
+        distance_percentiles = np.percentile(initial_distances, [33, 67])
+        near_mask = initial_distances <= distance_percentiles[0]
+        mid_mask = (initial_distances > distance_percentiles[0]) & (initial_distances <= distance_percentiles[1])
+        far_mask = initial_distances > distance_percentiles[1]
+        
+        # 分析各层的运动模式
+        layers = {
+            'near': {'mask': near_mask, 'motion': radial_motion[near_mask] if np.any(near_mask) else np.array([])},
+            'mid': {'mask': mid_mask, 'motion': radial_motion[mid_mask] if np.any(mid_mask) else np.array([])},
+            'far': {'mask': far_mask, 'motion': radial_motion[far_mask] if np.any(far_mask) else np.array([])}
+        }
+        
+        # 计算透视变化指标
+        perspective_metrics = {}
+        
+        for layer_name, layer_data in layers.items():
+            if len(layer_data['motion']) > 0:
+                perspective_metrics[f'{layer_name}_mean_radial'] = np.mean(layer_data['motion'])
+                perspective_metrics[f'{layer_name}_std_radial'] = np.std(layer_data['motion'])
+            else:
+                perspective_metrics[f'{layer_name}_mean_radial'] = 0
+                perspective_metrics[f'{layer_name}_std_radial'] = 0
+        
+        # 检测dolly运动的典型模式
+        dolly_indicators = self._detect_dolly_pattern(perspective_metrics, motion_magnitudes)
+        
+        return dolly_indicators, layers
+    
+    def _detect_dolly_pattern(self, perspective_metrics, motion_magnitudes):
+        """
+        检测dolly运动的典型模式
+        """
+        # dolly运动的特征：
+        # 1. 近景点向外/内运动幅度大
+        # 2. 远景点运动幅度小
+        # 3. 运动方向具有一致性
+        
+        near_radial = perspective_metrics.get('near_mean_radial', 0)
+        mid_radial = perspective_metrics.get('mid_mean_radial', 0)
+        far_radial = perspective_metrics.get('far_mean_radial', 0)
+        
+        # 运动阈值
+        motion_threshold = min(self.width, self.height) * 0.01
+        
+        indicators = {
+            'has_dolly_pattern': False,
+            'dolly_direction': 'static',
+            'confidence': 0.0,
+            'near_motion': near_radial,
+            'mid_motion': mid_radial,
+            'far_motion': far_radial
+        }
+        
+        # 检测dolly in模式（近景向外，远景向内或静止）
+        if near_radial > motion_threshold and near_radial > abs(far_radial):
+            indicators['has_dolly_pattern'] = True
+            indicators['dolly_direction'] = 'dolly_in'
+            indicators['confidence'] = min(1.0, abs(near_radial) / motion_threshold)
+        
+        # 检测dolly out模式（近景向内，远景向外或静止）
+        elif near_radial < -motion_threshold and abs(near_radial) > abs(far_radial):
+            indicators['has_dolly_pattern'] = True
+            indicators['dolly_direction'] = 'dolly_out'
+            indicators['confidence'] = min(1.0, abs(near_radial) / motion_threshold)
+        
+        return indicators
+    
+    def analyze_subject_motion(self, pred_tracks, pred_visibility, first_frame=0, last_frame=-1):
+        """
+        分析主体的运动模式
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            subject_motion: 主体运动分析结果
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+        
+        # 检测起始帧和结束帧的主体
+        subject_points_start, subject_center_start, subject_bbox_start = self.detect_subject(
+            pred_tracks, pred_visibility, first_frame)
+        subject_points_end, subject_center_end, subject_bbox_end = self.detect_subject(
+            pred_tracks, pred_visibility, last_frame)
+        
+        if subject_center_start is None or subject_center_end is None:
+            return {'valid': False, 'reason': 'no_subject_detected'}
+        
+        # 计算主体中心的移动
+        center_motion = subject_center_end - subject_center_start
+        
+        # 计算主体大小变化
+        size_change = 0
+        if subject_bbox_start is not None and subject_bbox_end is not None:
+            area_start = (subject_bbox_start[2] - subject_bbox_start[0]) * (subject_bbox_start[3] - subject_bbox_start[1])
+            area_end = (subject_bbox_end[2] - subject_bbox_end[0]) * (subject_bbox_end[3] - subject_bbox_end[1])
+            size_change = (area_end - area_start) / (area_start + 1e-6)
+        
+        # 分析主体特征点的运动模式
+        common_points = list(set(subject_points_start) & set(subject_points_end))
+        
+        subject_motion_pattern = None
+        if len(common_points) > 0:
+            subject_initial = pred_tracks[first_frame, common_points]
+            subject_final = pred_tracks[last_frame, common_points]
+            
+            # 计算主体内部运动的一致性
+            subject_motion_vectors = subject_final - subject_initial
+            motion_consistency = np.std(subject_motion_vectors, axis=0)
+            
+            subject_motion_pattern = {
+                'motion_vectors': subject_motion_vectors,
+                'consistency': motion_consistency,
+                'common_points_count': len(common_points)
+            }
+        
+        return {
+            'valid': True,
+            'center_motion': center_motion,
+            'size_change': size_change,
+            'subject_points_start': subject_points_start,
+            'subject_points_end': subject_points_end,
+            'motion_pattern': subject_motion_pattern
+        }
+    
+    def analyze_dolly_motion(self, pred_tracks, pred_visibility, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        综合分析dolly运动
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            dolly_result: dolly运动分析结果
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+        
+        # 1. 透视变化分析
+        perspective_result, depth_layers = self.analyze_perspective_change(
+            pred_tracks, stable_point_ids, first_frame, last_frame)
+        
+        # 2. 主体运动分析
+        subject_result = self.analyze_subject_motion(
+            pred_tracks, pred_visibility, first_frame, last_frame)
+        
+        # 3. 综合判断dolly运动
+        dolly_motion = {
+            'type': 'static',
+            'confidence': 0.0,
+            'details': {
+                'perspective': perspective_result,
+                'subject': subject_result,
+                'depth_layers': depth_layers
+            }
+        }
+        
+        if perspective_result and perspective_result.get('has_dolly_pattern', False):
+            dolly_type = perspective_result['dolly_direction']
+            confidence = perspective_result['confidence']
+            
+            # 验证主体运动是否与透视变化一致
+            if subject_result.get('valid', False):
+                # dolly in: 主体应该变大或位置变化不大
+                # dolly out: 主体应该变小或位置变化不大
+                subject_size_change = subject_result.get('size_change', 0)
+                
+                if dolly_type == 'dolly_in' and subject_size_change >= -0.1:  # 允许轻微缩小
+                    confidence *= 1.2  # 提高置信度
+                elif dolly_type == 'dolly_out' and subject_size_change <= 0.1:  # 允许轻微放大
+                    confidence *= 1.2  # 提高置信度
+                else:
+                    confidence *= 0.8  # 降低置信度
+            
+            dolly_motion['type'] = dolly_type
+            dolly_motion['confidence'] = min(1.0, confidence)
+        
+        return dolly_motion
+    
+    def detect_dolly_zoom_combination(self, pred_tracks, pred_visibility, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        检测dolly和zoom的复合运镜（如dolly in + zoom out）
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            combination_result: 复合运镜分析结果
+        """
+        # 分析dolly运动
+        dolly_result = self.analyze_dolly_motion(
+            pred_tracks, pred_visibility, stable_point_ids, first_frame, last_frame)
+        
+        # 分析zoom运动
+        zoom_result, _ = self.analyze_zoom_motion(pred_tracks, stable_point_ids, first_frame, last_frame)
+        
+        # 检测复合运镜
+        combination = {
+            'type': 'none',
+            'dolly_component': dolly_result,
+            'zoom_component': zoom_result,
+            'confidence': 0.0
+        }
+        
+        dolly_type = dolly_result.get('type', 'static')
+        dolly_confidence = dolly_result.get('confidence', 0.0)
+        
+        # 检测经典的复合运镜
+        if dolly_type != 'static' and zoom_result != 'static':
+            if dolly_type == 'dolly_in' and zoom_result == 'zoom_out':
+                combination['type'] = 'dolly_in_zoom_out'
+                combination['confidence'] = min(dolly_confidence, 0.8)  # 这种组合比较难检测
+            elif dolly_type == 'dolly_out' and zoom_result == 'zoom_in':
+                combination['type'] = 'dolly_out_zoom_in'
+                combination['confidence'] = min(dolly_confidence, 0.8)
+            elif dolly_type == 'dolly_in' and zoom_result == 'zoom_in':
+                combination['type'] = 'dolly_in_zoom_in'
+                combination['confidence'] = (dolly_confidence + 0.6) / 2  # 运动叠加，容易检测
+            elif dolly_type == 'dolly_out' and zoom_result == 'zoom_out':
+                combination['type'] = 'dolly_out_zoom_out'
+                combination['confidence'] = (dolly_confidence + 0.6) / 2
+        elif dolly_type != 'static':
+            combination['type'] = dolly_type
+            combination['confidence'] = dolly_confidence
+        
+        return combination
+    
     def get_edge_point(self, track):
         middle = self.grid_size // 2
         number = self.number_points / 2.0
@@ -745,7 +1104,17 @@ class CameraPredict:
         if zoom_type in ['zoom_in', 'zoom_out'] and zoom_type not in results:
             results.append(zoom_type)
         
-        # 4. 分析pan/tilt运动（作为补充验证）
+        # 4. 分析dolly运动（新增功能）
+        dolly_zoom_result = self.detect_dolly_zoom_combination(pred_tracks, pred_visibility, stable_point_ids)
+        print(f"Dolly/Zoom组合分析结果: {dolly_zoom_result}")
+        
+        # 添加dolly运动结果
+        dolly_type = dolly_zoom_result.get('type', 'none')
+        if dolly_type != 'none' and dolly_type not in results:
+            if dolly_zoom_result.get('confidence', 0) > 0.3:  # 设置置信度阈值
+                results.append(dolly_type)
+        
+        # 5. 分析pan/tilt运动（作为补充验证）
         pan_tilt_types, pan_tilt_details = self.analyze_pan_tilt_motion(pred_tracks, stable_point_ids)
         print(f"Pan/Tilt分析结果: {pan_tilt_types}")
         print(f"Pan/Tilt详细信息: {pan_tilt_details}")
@@ -756,15 +1125,23 @@ class CameraPredict:
             if motion_type not in results:
                 results.append(motion_type)
         
-        # 5. 检测复杂运动组合
+        # 6. 检测复杂运动组合
         if len(results) > 1:
             # 检查是否存在oblique运动（zoom + tilt的组合）
             has_zoom = any(r in ['zoom_in', 'zoom_out'] for r in results)
             has_tilt = any(r in ['tilt_up', 'tilt_down'] for r in results)
+            has_dolly = any(r in ['dolly_in', 'dolly_out'] for r in results)
+            
             if has_zoom and has_tilt and 'oblique' not in results:
                 results.append('oblique')
+            
+            # 检测dolly zoom效果（著名的电影运镜技法）
+            if has_dolly and has_zoom:
+                dolly_zoom_effects = [r for r in results if 'dolly_' in r and 'zoom_' in r]
+                if not dolly_zoom_effects:  # 如果没有检测到复合运镜，添加单独的标记
+                    results.append('dolly_zoom_effect')
         
-        # 6. 去重并过滤
+        # 7. 去重并过滤
         results = list(set(results))
         if 'static' in results and len(results) > 1:
             results.remove('static')
@@ -934,6 +1311,117 @@ def test_stable_point_edge_analysis(video_path, output_dir="./test_analysis", de
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         vis_output_path = os.path.join(output_dir, "edge_analysis_visualization.mp4")
+        camera.visualize_grid_tracks(video, 
+                                   torch.tensor(pred_tracks)[None], 
+                                   torch.tensor(pred_visibility)[None], 
+                                   vis_output_path, fps)
+        print(f"\n可视化结果已保存到: {vis_output_path}")
+
+def test_dolly_motion_detection(video_path, output_dir="./test_dolly_analysis", device="cuda", stability_threshold=0.8):
+    """
+    专门测试dolly运动检测功能
+    
+    Args:
+        video_path: 输入视频路径
+        output_dir: 输出目录
+        device: 设备类型
+        stability_threshold: 稳定性阈值
+    """
+    import decord
+    
+    # 默认模型配置
+    submodules_dict = {
+        "repo": "facebookresearch/co-tracker",
+        "model": "cotracker2_online"
+    }
+    
+    # 创建相机预测器
+    camera = CameraPredict(device, submodules_dict)
+    
+    # 读取视频
+    video_reader = decord.VideoReader(video_path)
+    video = video_reader.get_batch(range(len(video_reader)))
+    video = video.permute(0, 3, 1, 2)[None].float()
+    
+    if device == "cuda":
+        video = video.cuda()
+    
+    # 获取视频信息
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    cap.release()
+    
+    print(f"开始分析dolly运动: {video_path}")
+    print(f"视频尺寸: {video.shape}")
+    print(f"FPS: {fps}")
+    
+    # 进行预测和分析
+    pred_tracks, pred_visibility = camera.infer(video, fps=fps, save_video=False)
+    
+    print(f"\n=== 轨迹数据统计 ===")
+    print(f"轨迹形状: {pred_tracks.shape}")
+    print(f"可见性形状: {pred_visibility.shape}")
+    
+    # 分析稳定特征点
+    stable_point_ids = camera.find_stable_feature_points(pred_visibility, stability_threshold)
+    
+    if len(stable_point_ids) > 0:
+        print(f"\n=== Dolly运动检测测试 ===")
+        
+        # 1. 测试主体检测
+        subject_points, subject_center, subject_bbox = camera.detect_subject(pred_tracks, pred_visibility, 0)
+        print(f"主体检测结果:")
+        print(f"  主体特征点数: {len(subject_points)}")
+        print(f"  主体中心: {subject_center}")
+        print(f"  主体边界框: {subject_bbox}")
+        
+        # 2. 测试透视变化分析
+        perspective_result, depth_layers = camera.analyze_perspective_change(pred_tracks, stable_point_ids)
+        print(f"\n透视变化分析:")
+        if perspective_result:
+            print(f"  检测到dolly模式: {perspective_result.get('has_dolly_pattern', False)}")
+            print(f"  Dolly方向: {perspective_result.get('dolly_direction', 'static')}")
+            print(f"  置信度: {perspective_result.get('confidence', 0.0):.3f}")
+            print(f"  近景运动: {perspective_result.get('near_motion', 0.0):.3f}")
+            print(f"  中景运动: {perspective_result.get('mid_motion', 0.0):.3f}")
+            print(f"  远景运动: {perspective_result.get('far_motion', 0.0):.3f}")
+        
+        # 3. 测试主体运动分析
+        subject_motion = camera.analyze_subject_motion(pred_tracks, pred_visibility)
+        print(f"\n主体运动分析:")
+        if subject_motion.get('valid', False):
+            print(f"  中心移动: {subject_motion.get('center_motion', [0, 0])}")
+            print(f"  大小变化: {subject_motion.get('size_change', 0.0):.3f}")
+            motion_pattern = subject_motion.get('motion_pattern')
+            if motion_pattern:
+                print(f"  一致性: {motion_pattern.get('consistency', [0, 0])}")
+        
+        # 4. 测试dolly运动综合分析
+        dolly_result = camera.analyze_dolly_motion(pred_tracks, pred_visibility, stable_point_ids)
+        print(f"\nDolly运动综合分析:")
+        print(f"  运动类型: {dolly_result.get('type', 'static')}")
+        print(f"  置信度: {dolly_result.get('confidence', 0.0):.3f}")
+        
+        # 5. 测试dolly+zoom复合运镜检测
+        combination_result = camera.detect_dolly_zoom_combination(pred_tracks, pred_visibility, stable_point_ids)
+        print(f"\nDolly+Zoom复合运镜分析:")
+        print(f"  复合运镜类型: {combination_result.get('type', 'none')}")
+        print(f"  整体置信度: {combination_result.get('confidence', 0.0):.3f}")
+        print(f"  Dolly组件: {combination_result.get('dolly_component', {}).get('type', 'static')}")
+        print(f"  Zoom组件: {combination_result.get('zoom_component', 'static')}")
+        
+        # 6. 完整的运动分类结果
+        final_results = camera.predict_with_stable_points(pred_tracks, pred_visibility, stability_threshold)
+        print(f"\n=== 最终运动分类结果（包含Dolly检测）===")
+        print(f"检测到的所有相机运动类型: {final_results}")
+        
+    else:
+        print("未找到稳定的特征点，无法进行dolly运动分析")
+    
+    # 可选：保存可视化结果
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        vis_output_path = os.path.join(output_dir, "dolly_motion_visualization.mp4")
         camera.visualize_grid_tracks(video, 
                                    torch.tensor(pred_tracks)[None], 
                                    torch.tensor(pred_visibility)[None], 
