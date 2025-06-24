@@ -42,15 +42,22 @@ def analyze_perspective_change(self, pred_tracks, stable_point_ids):
     """
 ```
 
-### 3. 复合运镜检测
+### 3. 希区柯克变焦检测
 ```python
+def analyze_hitchcock_zoom_effect(self, pred_tracks, pred_visibility, stable_point_ids):
+    """
+    专门分析希区柯克变焦效果（Vertigo Effect）
+    - 检测主体大小是否保持相对稳定（<20%变化）
+    - 分析背景透视是否发生显著变化
+    - 验证dolly和zoom运动是否方向相反
+    """
+
 def detect_dolly_zoom_combination(self, pred_tracks, pred_visibility, stable_point_ids):
     """
-    检测dolly和zoom的复合运镜
-    - dolly_in_zoom_out: 希区柯克变焦效果
-    - dolly_out_zoom_in: 反向希区柯克效果
-    - dolly_in_zoom_in: 强化接近效果
-    - dolly_out_zoom_out: 强化远离效果
+    检测dolly和zoom的复合运镜，包括希区柯克变焦
+    - hitchcock_zoom: 经典希区柯克变焦
+    - reverse_hitchcock_zoom: 反向希区柯克变焦
+    - dolly_in_zoom_out: 一般dolly+zoom组合
     """
 ```
 
@@ -133,19 +140,37 @@ test_dolly_motion_detection(
 - `dolly_out`: 相机向后移动，主体远离
 
 ### 复合运镜类型  
-- `dolly_in_zoom_out`: 希区柯克变焦效果（前推后拉）
-- `dolly_out_zoom_in`: 反向希区柯克效果
+- `hitchcock_zoom`: 经典希区柯克变焦（Vertigo Effect）
+- `reverse_hitchcock_zoom`: 反向希区柯克变焦
+- `hitchcock_zoom_variant`: 希区柯克变焦变体
+- `reverse_hitchcock_zoom_variant`: 反向希区柯克变焦变体
+- `dolly_in_zoom_out`: 一般dolly in + zoom out组合
+- `dolly_out_zoom_in`: 一般dolly out + zoom in组合
 - `dolly_in_zoom_in`: 双重接近效果
 - `dolly_out_zoom_out`: 双重远离效果
 - `dolly_zoom_effect`: 一般dolly+zoom组合
 
 ## 特殊情况处理
 
-### Dolly In + Zoom Out
-这是最具挑战性的检测场景：
-- **问题**: 主体大小变化可能不明显
-- **解决**: 重点分析透视变化和背景运动模式
-- **关键指标**: 近景特征点向外扩散，远景特征点相对静止
+### 希区柯克变焦效果（Vertigo Effect）
+经典的电影运镜技法，最具挑战性的检测场景：
+
+#### 技术特征
+- **主体大小**: 基本保持不变（变化<20%）
+- **背景透视**: 发生显著变化
+- **运动组合**: dolly in + zoom out（或相反）
+- **视觉效果**: 主体稳定，背景"呼吸"或扭曲
+
+#### 检测策略
+1. **主体稳定性检测**: 计算主体边界框大小变化
+2. **透视变化分析**: 分析近景、中景、远景的运动模式
+3. **运动对立验证**: 确认dolly和zoom方向相反
+4. **置信度计算**: 基于透视强度和主体稳定性
+
+#### 检测类型
+- `hitchcock_zoom`: 经典希区柯克变焦（dolly in + zoom out）
+- `reverse_hitchcock_zoom`: 反向希区柯克变焦（dolly out + zoom in）
+- `hitchcock_zoom_variant`: 不完全符合但有类似特征的变体
 
 ### 低置信度情况
 当检测置信度较低时：
@@ -204,12 +229,20 @@ def compute_camera_motion(json_dir, device, submodules_dict, **kwargs):
   中景运动: 8.1
   远景运动: 2.4
 
+希区柯克变焦效果分析:
+  希区柯克类型: hitchcock_zoom
+  置信度: 0.856
+  主体大小变化: 0.083
+  有透视变化: True
+  Dolly-Zoom对立: True
+
 Dolly+Zoom复合运镜分析:
-  复合运镜类型: dolly_in_zoom_out
-  整体置信度: 0.672
+  复合运镜类型: hitchcock_zoom
+  整体置信度: 0.856
+  是否希区柯克效果: True
   Dolly组件: dolly_in
   Zoom组件: zoom_out
 
 === 最终运动分类结果（包含Dolly检测）===
-检测到的所有相机运动类型: ['dolly_in_zoom_out', 'dolly_zoom_effect']
+检测到的所有相机运动类型: ['hitchcock_zoom', 'dolly_zoom_effect']
 ``` 
