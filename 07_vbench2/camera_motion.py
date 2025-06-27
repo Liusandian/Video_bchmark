@@ -54,6 +54,302 @@ class CameraPredict:
             import ssl
             ssl._create_default_https_context = ssl._create_unverified_context
             self.model = torch.hub.load(submodules_list["repo"], submodules_list["model"]).to(self.device)
+        
+        # 初始化前景分割模型（可选）
+        self.use_foreground_segmentation = submodules_list.get("use_fg_segmentation", False)
+        if self.use_foreground_segmentation:
+            self.init_foreground_segmentation_model()
+
+    def init_foreground_segmentation_model(self):
+        """初始化前景分割模型"""
+        try:
+            # 优先使用MobileSAM（支持复杂前景分割）
+            from mobile_sam import sam_model_registry, SamPredictor
+            model_type = "vit_t"
+            sam_checkpoint = "mobile_sam.pt"  # 需要下载模型文件
+            sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+            self.fg_model = SamPredictor(sam)
+            self.fg_model_type = "mobile_sam"
+            print("使用MobileSAM模型进行复杂前景分割")
+        except ImportError:
+            try:
+                # 备选：使用RMBG（简单场景）
+                from rembg import rembg
+                self.fg_model = rembg
+                self.fg_model_type = "rmbg"
+                print("使用RMBG模型进行简单前景分割")
+            except ImportError:
+                try:
+                    # 高精度选项：Grounded SAM（如果资源允许）
+                    from groundingdino.util.inference import load_model as load_grounding_model
+                    from segment_anything import sam_model_registry, SamPredictor
+                    
+                    # 加载Grounding DINO
+                    self.grounding_model = load_grounding_model(
+                        "GroundingDINO_SwinT_OGC.py", 
+                        "groundingdino_swint_ogc.pth"
+                    )
+                    # 加载SAM
+                    sam = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+                    self.fg_model = SamPredictor(sam)
+                    self.fg_model_type = "grounded_sam"
+                    print("使用Grounded SAM模型进行语义前景分割")
+                except:
+                    print("前景分割模型加载失败，将使用传统方法")
+                    self.use_foreground_segmentation = False
+                    self.fg_model = None
+
+    def generate_smart_prompts(self, frame):
+        """
+        生成智能提示点，用于分割人像及周围相关物体
+        
+        Args:
+            frame: 输入图像帧 (H, W, C)
+            
+        Returns:
+            prompt_points: 提示点列表
+            prompt_boxes: 提示框列表
+        """
+        h, w = frame.shape[:2]
+        
+        # 生成多个提示点，覆盖可能的前景区域
+        prompt_points = []
+        
+        # 中心区域网格（人像主体）
+        center_points = [
+            [w//2, h*0.3],          # 头部区域
+            [w//2, h//2],           # 躯干中心
+            [w//2, h*0.7],          # 下半身
+            [w*0.4, h//2],          # 左侧
+            [w*0.6, h//2],          # 右侧
+        ]
+        
+        # 周围物体区域（栏杆、岩石、树干等）
+        surrounding_points = [
+            [w*0.2, h*0.8],         # 左下（栏杆、岩石）
+            [w*0.8, h*0.8],         # 右下（栏杆、岩石）
+            [w*0.1, h*0.5],         # 左边缘（树干）
+            [w*0.9, h*0.5],         # 右边缘（树干）
+            [w//2, h*0.9],          # 底部中心（地面物体）
+        ]
+        
+        prompt_points.extend(center_points)
+        prompt_points.extend(surrounding_points)
+        
+        # 生成提示框（用于更精确的分割）
+        prompt_boxes = [
+            [w*0.2, h*0.1, w*0.8, h*0.9],    # 主要前景区域
+            [w*0.1, h*0.7, w*0.9, h*0.95],   # 底部物体区域
+        ]
+        
+        return prompt_points, prompt_boxes
+
+    def segment_foreground(self, frame):
+        """
+        使用深度学习模型进行复杂前景分割
+        
+        Args:
+            frame: 输入图像帧 (H, W, C)
+            
+        Returns:
+            foreground_mask: 前景掩码 (H, W)
+        """
+        if not self.use_foreground_segmentation or self.fg_model is None:
+            return None
+            
+        try:
+            if self.fg_model_type == "mobile_sam":
+                return self._segment_with_mobile_sam(frame)
+            elif self.fg_model_type == "grounded_sam":
+                return self._segment_with_grounded_sam(frame)
+            elif self.fg_model_type == "rmbg":
+                return self._segment_with_rmbg(frame)
+                
+        except Exception as e:
+            print(f"前景分割失败: {e}")
+            return None
+        
+        return None
+
+    def _segment_with_mobile_sam(self, frame):
+        """使用MobileSAM进行复杂前景分割"""
+        self.fg_model.set_image(frame)
+        
+        # 生成智能提示
+        prompt_points, prompt_boxes = self.generate_smart_prompts(frame)
+        all_masks = []
+        
+        # 1. 使用点提示进行分割
+        for point in prompt_points:
+            try:
+                masks, scores, _ = self.fg_model.predict(
+                    point_coords=np.array([point]),
+                    point_labels=np.array([1]),  # 前景点
+                    multimask_output=False
+                )
+                if len(masks) > 0 and scores[0] > 0.5:  # 质量阈值
+                    all_masks.append(masks[0])
+            except:
+                continue
+        
+        # 2. 使用框提示进行分割（补充）
+        for box in prompt_boxes:
+            try:
+                masks, scores, _ = self.fg_model.predict(
+                    box=np.array(box),
+                    multimask_output=False
+                )
+                if len(masks) > 0 and scores[0] > 0.3:  # 框分割使用更低阈值
+                    all_masks.append(masks[0])
+            except:
+                continue
+        
+        # 3. 合并所有mask
+        if all_masks:
+            # 使用逻辑或合并所有mask
+            combined_mask = np.logical_or.reduce(all_masks)
+            
+            # 后处理：去除小的噪声区域
+            combined_mask = self._post_process_mask(combined_mask)
+            
+            return combined_mask.astype(np.float32)
+        
+        return None
+
+    def _segment_with_grounded_sam(self, frame):
+        """使用Grounded SAM进行语义前景分割"""
+        from groundingdino.util.inference import predict
+        
+        # 定义文本提示，描述需要分割的前景物体
+        text_prompt = "person . human . railing . fence . rock . stone . tree trunk . pole . barrier"
+        
+        # 1. 使用Grounding DINO检测相关物体
+        try:
+            boxes, _, _ = predict(
+                model=self.grounding_model,
+                image=frame,
+                caption=text_prompt,
+                box_threshold=0.25,  # 降低阈值以捕获更多相关物体
+                text_threshold=0.2
+            )
+            
+            # 2. 使用SAM对检测到的区域进行精确分割
+            self.fg_model.set_image(frame)
+            masks = []
+            
+            for box in boxes:
+                mask, scores, _ = self.fg_model.predict(
+                    box=box, 
+                    multimask_output=False
+                )
+                if len(mask) > 0 and scores[0] > 0.3:
+                    masks.append(mask[0])
+            
+            # 3. 合并所有前景mask
+            if masks:
+                combined_mask = np.logical_or.reduce(masks)
+                combined_mask = self._post_process_mask(combined_mask)
+                return combined_mask.astype(np.float32)
+                
+        except Exception as e:
+            print(f"Grounded SAM分割失败: {e}")
+            
+        return None
+
+    def _segment_with_rmbg(self, frame):
+        """使用RMBG进行简单前景分割"""
+        output = self.fg_model.remove(frame)
+        if output.shape[2] == 4:  # RGBA
+            mask = output[:, :, 3] / 255.0  # 归一化alpha通道
+            return mask
+        else:
+            return np.ones((frame.shape[0], frame.shape[1]), dtype=np.float32)
+
+    def _post_process_mask(self, mask):
+        """
+        后处理mask，去除噪声和孤立区域
+        
+        Args:
+            mask: 二值mask (H, W)
+            
+        Returns:
+            processed_mask: 处理后的mask
+        """
+        import cv2
+        
+        # 转换为uint8格式
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        
+        # 形态学操作：先开运算去除噪声，再闭运算填补孔洞
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+        mask_uint8 = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, kernel)
+        
+        # 去除小的连通区域
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_uint8)
+        
+        # 保留面积大于总面积1%的连通区域
+        total_area = mask.shape[0] * mask.shape[1]
+        min_area = total_area * 0.01
+        
+        filtered_mask = np.zeros_like(mask_uint8)
+        for i in range(1, num_labels):  # 跳过背景标签0
+            if stats[i, cv2.CC_STAT_AREA] > min_area:
+                filtered_mask[labels == i] = 255
+        
+        return (filtered_mask / 255.0).astype(np.float32)
+
+    def detect_subject_with_segmentation(self, pred_tracks, pred_visibility, frame_idx=0, video_frame=None):
+        """
+        结合前景分割改进主体检测
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            frame_idx: 分析的帧索引
+            video_frame: 原始视频帧 (H, W, C)，用于前景分割
+            
+        Returns:
+            subject_points: 主体区域的特征点ID列表
+            subject_center: 主体中心坐标
+            subject_bbox: 主体边界框
+        """
+        # 首先尝试使用前景分割
+        foreground_mask = None
+        if video_frame is not None and self.use_foreground_segmentation:
+            foreground_mask = self.segment_foreground(video_frame)
+        
+        # 获取当前帧的可见特征点
+        visible_mask = pred_visibility[frame_idx] > 0.5
+        visible_points = pred_tracks[frame_idx, visible_mask]
+        visible_ids = np.where(visible_mask)[0]
+        
+        if len(visible_points) == 0:
+            return [], None, None
+        
+        if foreground_mask is not None:
+            # 使用前景分割结果筛选特征点
+            subject_points = []
+            for i, point in enumerate(visible_points):
+                x, y = int(point[0]), int(point[1])
+                if (0 <= x < foreground_mask.shape[1] and 
+                    0 <= y < foreground_mask.shape[0] and 
+                    foreground_mask[y, x] > 0.5):  # 在前景区域内
+                    subject_points.append(visible_ids[i])
+            
+            if len(subject_points) > 0:
+                subject_coords = pred_tracks[frame_idx, subject_points]
+                subject_center = np.mean(subject_coords, axis=0)
+                
+                # 计算主体边界框
+                min_x, min_y = np.min(subject_coords, axis=0)
+                max_x, max_y = np.max(subject_coords, axis=0)
+                subject_bbox = [min_x, min_y, max_x, max_y]
+                
+                return subject_points, subject_center, subject_bbox
+        
+        # 如果前景分割失败或没有启用，回退到原始方法
+        return self.detect_subject(pred_tracks, pred_visibility, frame_idx)
 
     def transform360(self, vector):
         up=[]
@@ -729,9 +1025,98 @@ class CameraPredict:
         
         return dolly_motion
     
+    def analyze_hitchcock_zoom_effect(self, pred_tracks, pred_visibility, stable_point_ids, first_frame=0, last_frame=-1):
+        """
+        专门分析希区柯克变焦效果（Vertigo Effect）
+        希区柯克变焦的特征：主体大小基本保持不变，但背景透视发生显著变化
+        
+        Args:
+            pred_tracks: (T, N, 2) 轨迹数据
+            pred_visibility: (T, N) 可见性数据
+            stable_point_ids: 稳定特征点ID列表
+            first_frame: 起始帧
+            last_frame: 结束帧
+            
+        Returns:
+            hitchcock_result: 希区柯克变焦分析结果
+        """
+        if last_frame == -1:
+            last_frame = pred_tracks.shape[0] - 1
+        
+        # 检测主体
+        subject_points_start, subject_center_start, subject_bbox_start = self.detect_subject(
+            pred_tracks, pred_visibility, first_frame)
+        subject_points_end, subject_center_end, subject_bbox_end = self.detect_subject(
+            pred_tracks, pred_visibility, last_frame)
+        
+        if not subject_points_start or not subject_points_end:
+            return {'type': 'none', 'confidence': 0.0, 'reason': 'no_subject'}
+        
+        # 计算主体大小变化
+        subject_size_change = 0
+        if subject_bbox_start is not None and subject_bbox_end is not None:
+            area_start = (subject_bbox_start[2] - subject_bbox_start[0]) * (subject_bbox_start[3] - subject_bbox_start[1])
+            area_end = (subject_bbox_end[2] - subject_bbox_end[0]) * (subject_bbox_end[3] - subject_bbox_end[1])
+            subject_size_change = abs(area_end - area_start) / (area_start + 1e-6)
+        
+        # 分析透视变化
+        perspective_result, _ = self.analyze_perspective_change(
+            pred_tracks, stable_point_ids, first_frame, last_frame)
+        
+        # 分析zoom运动
+        zoom_result, _ = self.analyze_zoom_motion(pred_tracks, stable_point_ids, first_frame, last_frame)
+        
+        # 希区柯克变焦的判定条件：
+        # 1. 主体大小变化相对较小（<20%）
+        # 2. 有明显的透视变化
+        # 3. 同时检测到dolly和zoom运动且方向相反
+        
+        hitchcock_indicators = {
+            'type': 'none',
+            'confidence': 0.0,
+            'subject_size_change': subject_size_change,
+            'has_perspective_change': False,
+            'dolly_zoom_opposition': False
+        }
+        
+        if perspective_result and perspective_result.get('has_dolly_pattern', False):
+            dolly_direction = perspective_result.get('dolly_direction', 'static')
+            perspective_confidence = perspective_result.get('confidence', 0.0)
+            
+            # 检测希区柯克变焦的典型模式
+            is_hitchcock = False
+            hitchcock_type = 'none'
+            
+            # 经典希区柯克变焦：dolly in + zoom out
+            if (dolly_direction == 'dolly_in' and zoom_result == 'zoom_out' and 
+                subject_size_change < 0.2):  # 主体大小变化不大
+                is_hitchcock = True
+                hitchcock_type = 'hitchcock_zoom'
+                hitchcock_indicators['dolly_zoom_opposition'] = True
+            
+            # 反向希区柯克变焦：dolly out + zoom in
+            elif (dolly_direction == 'dolly_out' and zoom_result == 'zoom_in' and 
+                  subject_size_change < 0.2):
+                is_hitchcock = True
+                hitchcock_type = 'reverse_hitchcock_zoom'
+                hitchcock_indicators['dolly_zoom_opposition'] = True
+            
+            if is_hitchcock:
+                # 计算置信度（基于透视变化强度和主体大小稳定性）
+                size_stability = max(0, 1.0 - subject_size_change * 5)  # 大小越稳定分数越高
+                confidence = (perspective_confidence * 0.7 + size_stability * 0.3)
+                
+                hitchcock_indicators.update({
+                    'type': hitchcock_type,
+                    'confidence': min(1.0, confidence),
+                    'has_perspective_change': True
+                })
+        
+        return hitchcock_indicators
+
     def detect_dolly_zoom_combination(self, pred_tracks, pred_visibility, stable_point_ids, first_frame=0, last_frame=-1):
         """
-        检测dolly和zoom的复合运镜（如dolly in + zoom out）
+        检测dolly和zoom的复合运镜，包括希区柯克变焦效果
         
         Args:
             pred_tracks: (T, N, 2) 轨迹数据
@@ -743,19 +1128,35 @@ class CameraPredict:
         Returns:
             combination_result: 复合运镜分析结果
         """
-        # 分析dolly运动
+        # 首先检测希区柯克变焦效果
+        hitchcock_result = self.analyze_hitchcock_zoom_effect(
+            pred_tracks, pred_visibility, stable_point_ids, first_frame, last_frame)
+        
+        # 如果检测到希区柯克变焦且置信度较高，优先返回
+        if (hitchcock_result['type'] != 'none' and 
+            hitchcock_result['confidence'] > 0.4):
+            return {
+                'type': hitchcock_result['type'],
+                'confidence': hitchcock_result['confidence'],
+                'hitchcock_details': hitchcock_result,
+                'is_hitchcock_effect': True
+            }
+        
+        # 分析一般dolly运动
         dolly_result = self.analyze_dolly_motion(
             pred_tracks, pred_visibility, stable_point_ids, first_frame, last_frame)
         
         # 分析zoom运动
         zoom_result, _ = self.analyze_zoom_motion(pred_tracks, stable_point_ids, first_frame, last_frame)
         
-        # 检测复合运镜
+        # 检测一般复合运镜
         combination = {
             'type': 'none',
             'dolly_component': dolly_result,
             'zoom_component': zoom_result,
-            'confidence': 0.0
+            'confidence': 0.0,
+            'is_hitchcock_effect': False,
+            'hitchcock_details': hitchcock_result
         }
         
         dolly_type = dolly_result.get('type', 'static')
@@ -764,14 +1165,20 @@ class CameraPredict:
         # 检测经典的复合运镜
         if dolly_type != 'static' and zoom_result != 'static':
             if dolly_type == 'dolly_in' and zoom_result == 'zoom_out':
+                # 即使不是完美的希区柯克变焦，也标注为相关类型
                 combination['type'] = 'dolly_in_zoom_out'
-                combination['confidence'] = min(dolly_confidence, 0.8)  # 这种组合比较难检测
+                combination['confidence'] = min(dolly_confidence, 0.8)
+                # 如果有希区柯克变焦的特征，添加标注
+                if hitchcock_result['dolly_zoom_opposition']:
+                    combination['type'] = 'hitchcock_zoom_variant'
             elif dolly_type == 'dolly_out' and zoom_result == 'zoom_in':
                 combination['type'] = 'dolly_out_zoom_in'
                 combination['confidence'] = min(dolly_confidence, 0.8)
+                if hitchcock_result['dolly_zoom_opposition']:
+                    combination['type'] = 'reverse_hitchcock_zoom_variant'
             elif dolly_type == 'dolly_in' and zoom_result == 'zoom_in':
                 combination['type'] = 'dolly_in_zoom_in'
-                combination['confidence'] = (dolly_confidence + 0.6) / 2  # 运动叠加，容易检测
+                combination['confidence'] = (dolly_confidence + 0.6) / 2
             elif dolly_type == 'dolly_out' and zoom_result == 'zoom_out':
                 combination['type'] = 'dolly_out_zoom_out'
                 combination['confidence'] = (dolly_confidence + 0.6) / 2
@@ -1402,11 +1809,21 @@ def test_dolly_motion_detection(video_path, output_dir="./test_dolly_analysis", 
         print(f"  运动类型: {dolly_result.get('type', 'static')}")
         print(f"  置信度: {dolly_result.get('confidence', 0.0):.3f}")
         
-        # 5. 测试dolly+zoom复合运镜检测
+        # 5. 测试希区柯克变焦效果检测
+        hitchcock_result = camera.analyze_hitchcock_zoom_effect(pred_tracks, pred_visibility, stable_point_ids)
+        print(f"\n希区柯克变焦效果分析:")
+        print(f"  希区柯克类型: {hitchcock_result.get('type', 'none')}")
+        print(f"  置信度: {hitchcock_result.get('confidence', 0.0):.3f}")
+        print(f"  主体大小变化: {hitchcock_result.get('subject_size_change', 0.0):.3f}")
+        print(f"  有透视变化: {hitchcock_result.get('has_perspective_change', False)}")
+        print(f"  Dolly-Zoom对立: {hitchcock_result.get('dolly_zoom_opposition', False)}")
+        
+        # 6. 测试dolly+zoom复合运镜检测
         combination_result = camera.detect_dolly_zoom_combination(pred_tracks, pred_visibility, stable_point_ids)
         print(f"\nDolly+Zoom复合运镜分析:")
         print(f"  复合运镜类型: {combination_result.get('type', 'none')}")
         print(f"  整体置信度: {combination_result.get('confidence', 0.0):.3f}")
+        print(f"  是否希区柯克效果: {combination_result.get('is_hitchcock_effect', False)}")
         print(f"  Dolly组件: {combination_result.get('dolly_component', {}).get('type', 'static')}")
         print(f"  Zoom组件: {combination_result.get('zoom_component', 'static')}")
         
